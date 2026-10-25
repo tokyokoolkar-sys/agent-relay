@@ -46,6 +46,24 @@ describe('RpcPeer', () => {
     expect(handler).toHaveBeenCalledTimes(2)
   })
 
+  it('a throwing notification handler does not stop later messages', async () => {
+    const { a, b } = pair()
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const handler = vi.fn().mockImplementationOnce(() => {
+      throw new Error('boom')
+    })
+    b.onNotification(handler)
+    b.onRequest(async () => ({ ok: 1 }))
+    a.notify('first', {})
+    a.notify('second', { n: 2 })
+    await tick()
+    expect(handler).toHaveBeenCalledTimes(2)
+    expect(handler).toHaveBeenLastCalledWith('second', { n: 2 })
+    expect(errors).toHaveBeenCalledWith(expect.stringContaining('[rpc]'), expect.any(Error))
+    await expect(a.request('x', {})).resolves.toEqual({ ok: 1 })
+    errors.mockRestore()
+  })
+
   it('close rejects pending', async () => {
     const { a, b } = pair()
     b.onRequest(() => new Promise(() => {})) // never answers

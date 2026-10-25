@@ -64,7 +64,13 @@ export class RpcPeer {
     while ((nl = this.#buffer.indexOf('\n')) !== -1) {
       const line = this.#buffer.slice(0, nl).trim()
       this.#buffer = this.#buffer.slice(nl + 1)
-      if (line) this.#onLine(line)
+      if (!line) continue
+      try {
+        this.#onLine(line)
+      } catch (err) {
+        // Never let a handler failure escape the stream listener: it would crash the whole bridge.
+        console.error('[rpc] error while handling message:', err)
+      }
     }
   }
 
@@ -78,7 +84,9 @@ export class RpcPeer {
     if (typeof msg !== 'object' || msg === null) return
 
     if (typeof msg.method === 'string') {
-      if (msg.id !== undefined && msg.id !== null) void this.#handleRequest(msg.id, msg.method, msg.params)
+      if (msg.id !== undefined && msg.id !== null) {
+        this.#handleRequest(msg.id, msg.method, msg.params).catch((err) => console.error('[rpc] error while answering request:', err))
+      }
       else this.#notificationHandler?.(msg.method, msg.params)
       return
     }

@@ -19,7 +19,7 @@ const usage = (amount: number) => ({ update: { sessionUpdate: 'usage_update', us
 
 type Made = { task: Task; repo: string; events: BridgeEvent[]; wt: string; log: () => string }
 
-async function make(scriptOrFn: unknown[] | ((wt: string) => unknown[]), opts: { agent?: AgentId; req?: Partial<DelegateRequest>; env?: Record<string, string> } = {}): Promise<Made> {
+async function make(scriptOrFn: unknown[] | ((wt: string) => unknown[]), opts: { agent?: AgentId; req?: Partial<DelegateRequest>; env?: Record<string, string>; handshakeTimeoutMs?: number } = {}): Promise<Made> {
   const agent = opts.agent ?? 'opencode'
   const logDir = mkdtempSync(join(tmpdir(), 'relay-fakelog-'))
   logDirs.push(logDir)
@@ -37,6 +37,7 @@ async function make(scriptOrFn: unknown[] | ((wt: string) => unknown[]), opts: {
     spec: agentSpec(agent, 'unused'),
     req: { agent, title: 'Do the thing', brief: 'please do the thing', repoPath: repo, ...opts.req },
     emit: (e) => events.push(e),
+    handshakeTimeoutMs: opts.handshakeTimeoutMs,
   })
   tasks.push(task)
   const log = () => {
@@ -64,7 +65,7 @@ const waitStatus = (m: Made, s: string) => waitFor(() => m.task.summary().status
 
 afterEach(async () => {
   await Promise.all(tasks.splice(0).map((t) => t.cancel().catch(() => {})))
-  for (const k of ['RELAY_FAKE_AGENT', 'FAKE_SCRIPT', 'FAKE_LOG', 'FAKE_OPTIONS', 'FAKE_EFFORT_AFTER_MODEL']) delete process.env[k]
+  for (const k of ['RELAY_FAKE_AGENT', 'FAKE_SCRIPT', 'FAKE_LOG', 'FAKE_OPTIONS', 'FAKE_EFFORT_AFTER_MODEL', 'FAKE_HANG_INIT']) delete process.env[k]
   for (const d of logDirs.splice(0)) rmSync(d, { recursive: true, force: true })
   await cleanupRepos()
 })
@@ -215,10 +216,10 @@ describe('Task', () => {
     expect(attentions(m.events).map((a) => a.reason)).toEqual(['turn_ended'])
   })
 
-  it('reply sends a second prompt and sums cost across prompts', async () => {
+  it('reply sends a second prompt; costUsd is the latest session-cumulative amount', async () => {
     const m = await make([
       [usage(0.001), msg('first'), { stop: 'end_turn' }],
-      [usage(0.002), msg('second'), { stop: 'end_turn' }],
+      [usage(0.003), msg('second'), { stop: 'end_turn' }],
     ])
     await m.task.start()
     await waitStatus(m, 'idle')
@@ -264,11 +265,12 @@ describe('Task', () => {
     expect(attentions(m.events)).toMatchObject([{ reason: 'out_of_credits' }])
   })
 
-  it('reports out_of_credits when the final message says so (Command Code only)', async () => {
+  it('a Command Code turn whose final message says out of credits ends out_of_credits (opencode does not)', async () => {
     const m = await make([[msg('Insufficient credits to continue'), { stop: 'end_turn' }]], { agent: 'commandcode' })
     await m.task.start()
-    await waitStatus(m, 'idle')
+    await waitStatus(m, 'out_of_credits')
     expect(attentions(m.events).map((a) => a.reason)).toEqual(['out_of_credits'])
+    await expect(m.task.reply('more')).rejects.toMatchObject({ code: 'not_idle' })
 
     const o = await make([[msg('Insufficient credits to continue'), { stop: 'end_turn' }]], { agent: 'opencode' })
     await o.task.start()
@@ -319,5 +321,108 @@ describe('Task', () => {
     expect(att[0]!.reason).toBe('turn_ended')
     expect(att[0]!.text).toContain('nested_repo')
     expect(m.task.detail(false).thread.some((t) => t.from === 'bridge' && t.kind === 'error' && t.text.startsWith('nested_repo:'))).toBe(true)
+  })
+  it('cancel during startup spawns no agent', async () => {
+    const m = await make([[msg('never')]])
+    const started = m.task.start()
+    await m.task.cancel()
+    await started
+    await new Promise((r) => setTimeout(r, 300))
+    expect(m.task.summary().status).toBe('cancelled')
+    expect(m.log()).not.toContain('started pid=')
+  })
+
+  it('cancel during the handshake kills the agent', async () => {
+    const m = await make([[msg('never')]], { env: { FAKE_HANG_INIT: '1' } })
+    const started = m.task.start()
+    await waitFor(() => m.log().includes('started pid='), 'agent start')
+    const pid = Number(/started pid=(\d+)/.exec(m.log())![1])
+    await m.task.cancel()
+    await started
+    expect(m.task.summary().status).toBe('cancelled')
+    await waitFor(() => {
+      try {
+        process.kill(pid, 0)
+        return false
+      } catch {
+        return true
+      }
+    }, `agent ${pid} to be gone`, 5000)
+  })
+
+  it('a late permission request holds its status and does not wedge the task', async () => {
+    const m = await make([
+      [
+        msg('first'),
+        {
+          stop: 'end_turn',
+          after: { permission: { toolCall: { toolCallId: 'l1', title: 'Run: ls', kind: 'execute', rawInput: { command: 'ls' } }, options: ccOptions } },
+        },
+      ],
+      [msg('second'), { stop: 'end_turn' }],
+    ])
+    await m.task.start()
+    await waitStatus(m, 'waiting_permission')
+    await new Promise((r) => setTimeout(r, 200))
+    expect(m.task.summary().status).toBe('waiting_permission')
+    const pending = m.task.summary().pending!
+    m.task.answer(pending.requestId, 'allow_once')
+    await waitStatus(m, 'idle') // 'running' only while the post-turn commit is still in flight
+    await waitFor(() => m.log().includes('late answer:allow_once'), 'agent saw the answer')
+    await m.task.reply('again')
+    await waitFor(() => m.task.summary().lastMessage === 'second', 'second turn')
+    await waitStatus(m, 'idle')
+  })
+
+  it('fails the task when the agent never answers initialize', async () => {
+    const m = await make([[msg('never')]], { env: { FAKE_HANG_INIT: '1' }, handshakeTimeoutMs: 300 })
+    await m.task.start()
+    await waitStatus(m, 'failed')
+    const att = attentions(m.events)
+    expect(att).toHaveLength(1)
+    expect(att[0]!.reason).toBe('failed')
+    expect(att[0]!.text).toContain('initialize timed out')
+    expect(att[0]!.text).toContain('started pid=')
+  })
+
+  it('announces a truncated permission preview and keeps the full input in detail', async () => {
+    const command = `echo ${'x'.repeat(900)}`
+    const m = await make([[{ permission: { toolCall: { toolCallId: 'p2', title: 'Run: long', kind: 'execute', rawInput: { command } }, options: ccOptions } }, { stop: 'end_turn' }]])
+    await m.task.start()
+    await waitStatus(m, 'waiting_permission')
+    const text = attentions(m.events)[0]!.text
+    const total = JSON.stringify({ command }).length
+    expect(text).toContain('truncated')
+    expect(text).toContain(`${total} chars`)
+    expect(text).not.toContain('x'.repeat(600))
+    expect((m.task.detail(false).pending!.rawInput as { command: string }).command).toBe(command)
+  })
+
+  it('child exit while a permission is pending fails the task and clears the pending request', async () => {
+    const m = await make([[{ permission: { toolCall: { toolCallId: 'p3', title: 'Run: x', kind: 'execute', rawInput: { command: 'x' } }, options: ccOptions }, exitAfterMs: 400 }]])
+    await m.task.start()
+    await waitStatus(m, 'waiting_permission')
+    await waitStatus(m, 'failed')
+    expect(m.task.summary().pending).toBeUndefined()
+    const failed = attentions(m.events).filter((a) => a.reason === 'failed')
+    expect(failed).toHaveLength(1)
+    expect(failed[0]!.text).toContain('4')
+  })
+
+  it('survives an emit handler that throws', async () => {
+    process.env.RELAY_FAKE_AGENT = FAKE
+    process.env.FAKE_SCRIPT = JSON.stringify([[msg('ok'), { stop: 'end_turn' }]])
+    const repo = await makeRepo()
+    const task = new Task({
+      id: 'oc-1',
+      spec: agentSpec('opencode', 'unused'),
+      req: { agent: 'opencode', title: 't', brief: 'b', repoPath: repo },
+      emit: () => {
+        throw new Error('subscriber bug')
+      },
+    })
+    tasks.push(task)
+    await task.start()
+    await waitFor(() => task.summary().status === 'idle', 'idle')
   })
 })

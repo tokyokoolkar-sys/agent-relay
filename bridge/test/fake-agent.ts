@@ -2,8 +2,9 @@
 //   FAKE_SCRIPT  JSON: a list of steps per prompt (prompt N runs script[N]; a flat list of steps is one prompt).
 //   FAKE_OPTIONS (optional) comma list of advertised config options (default "model,effort").
 //   FAKE_EFFORT_AFTER_MODEL (optional) "1": the effort option only appears once a model is set (as OpenCode does).
+//   FAKE_HANG_INIT (optional) "1": never answer initialize.
 //   FAKE_LOG (optional) file that also receives every stderr log line.
-// Steps: {update}, {permission}, {exit}, {error}, {writeFile}, {stderr}, {hang}, {stop}.
+// Steps: {update}, {permission, exitAfterMs?}, {exit}, {error}, {writeFile}, {stderr}, {hang}, {stop, after?: {permission}} (after: a request sent once the prompt has resolved).
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -71,11 +72,13 @@ async function runPrompt(id: number, steps: Step[]) {
       return
     } else if (step.hang) await stopper
     else if (step.permission) {
+      if (step.exitAfterMs) setTimeout(() => process.exit(4), step.exitAfterMs)
       const optionId = await permissionStep(step, stopper)
       update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `answer:${optionId}` } })
     } else if (step.stop) {
       activePrompt = undefined
       send({ jsonrpc: '2.0', id, result: { stopReason: step.stop, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } } })
+      if (step.after?.permission) log(`late answer:${await permissionStep(step.after, stopper)}`)
       return
     }
   }
@@ -92,6 +95,7 @@ function handle(msg: any) {
   const reply = (result: unknown) => send({ jsonrpc: '2.0', id: msg.id, result })
   switch (msg.method) {
     case 'initialize':
+      if (process.env.FAKE_HANG_INIT === '1') return
       return reply({ protocolVersion: 1, agentCapabilities: {}, authMethods: [] })
     case 'session/new':
       cwd = msg.params.cwd
@@ -125,3 +129,4 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   }
 })
 process.stdin.on('end', () => process.exit(0))
+log(`started pid=${process.pid}`)

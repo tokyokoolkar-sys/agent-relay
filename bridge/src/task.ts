@@ -11,10 +11,20 @@ type Outcome = { outcome: { outcome: 'selected'; optionId: string } | { outcome:
 type PendingEntry = { pending: PendingRequest; resolve: (o: Outcome) => void }
 
 const STDERR_LINES = 20
+const HANDSHAKE_TIMEOUT_MS = 60_000
+const PREVIEW_CHARS = 500
 const ACTIVITY_CAP = 1000
 const TERMINAL: readonly TaskStatus[] = ['done', 'failed', 'cancelled', 'out_of_credits']
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e))
+class HandshakeTimeout extends Error {}
+
+/** First PREVIEW_CHARS of the request's input; a cut is announced so nobody approves on a partial view. */
+function preview(input: unknown): string {
+  const full = JSON.stringify(input ?? null)
+  if (full.length <= PREVIEW_CHARS) return full
+  return `${full.slice(0, PREVIEW_CHARS)}…[truncated, ${full.length} chars — read relay_status {taskId, full:true} before approving]`
+}
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref())
 
 /**
@@ -26,6 +36,8 @@ export class Task {
   #spec: AgentSpec
   #req: DelegateRequest
   #emit: (e: BridgeEvent) => void
+  #handshakeTimeoutMs: number
+  #turnActive = false
 
   #status: TaskStatus = 'starting'
   #startedAt = Date.now()
@@ -43,8 +55,7 @@ export class Task {
   #currentStep: string | undefined
   #files = new Set<string>()
   #toolKinds = new Map<string, string>()
-  #costDone = 0
-  #costTurn = 0
+  #cost = 0
   #turnText = ''
   #lastMessage: string | undefined
   #waitingOnUser = false
@@ -54,11 +65,19 @@ export class Task {
   #thread: ThreadEntry[] = []
   #activity: ActivityEntry[] = []
 
-  constructor(opts: { id: string; spec: AgentSpec; req: DelegateRequest; emit: (e: BridgeEvent) => void }) {
+  constructor(opts: { id: string; spec: AgentSpec; req: DelegateRequest; emit: (e: BridgeEvent) => void; handshakeTimeoutMs?: number }) {
     this.id = opts.id
     this.#spec = opts.spec
     this.#req = opts.req
-    this.#emit = opts.emit
+    this.#handshakeTimeoutMs = opts.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS
+    // A throwing subscriber must never break task state or turn into an unhandled rejection.
+    this.#emit = (e) => {
+      try {
+        opts.emit(e)
+      } catch (err) {
+        console.error(`[task ${opts.id}] emit handler threw:`, err)
+      }
+    }
   }
 
   // ---- public API -------------------------------------------------------------------------------------------
@@ -68,31 +87,54 @@ export class Task {
     try {
       this.#wt = await createWorktree(this.#req.repoPath, this.id)
     } catch (err) {
-      this.#status = 'failed' // nothing exists yet: the caller reports the refusal, no event is published
+      if (!this.#isTerminal()) this.#status = 'failed' // nothing exists yet: the caller reports the refusal, no event is published
       this.#addThread('bridge', 'error', errText(err))
       throw err
     }
+    if (this.#isTerminal()) return // cancelled while the worktree was being made: never spawn
     this.#addThread('claude', 'brief', this.#req.brief)
     this.#changed()
     try {
       this.#spawn()
-      const rpc = this.#rpc!
-      await rpc.request('initialize', {
-        protocolVersion: 1,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-        clientInfo: { name: 'agent-relay', version: '0.1.0' },
-      })
-      const created = await rpc.request<{ sessionId: string; configOptions?: ConfigOption[] }>('session/new', { cwd: this.#wt.path, mcpServers: [] })
-      this.#sessionId = created.sessionId
-      let options = created.configOptions ?? []
-      if (this.#req.model) options = await this.#setOption('model', this.#req.model, options)
-      if (this.#req.effort) options = await this.#setOption('effort', this.#req.effort, options)
+      await this.#handshake()
     } catch (err) {
       await this.#failFromError(err, 'agent setup failed')
       return
     }
+    if (this.#isTerminal()) {
+      this.#kill() // cancelled mid-handshake: do not leave the agent running
+      return
+    }
+    this.#startTurn(this.#req.brief)
+  }
+
+  async #handshake(): Promise<void> {
+    await this.#hs('initialize', {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      clientInfo: { name: 'agent-relay', version: '0.1.0' },
+    })
     if (this.#isTerminal()) return
-    void this.#runTurn(this.#req.brief)
+    const created = await this.#hs<{ sessionId: string; configOptions?: ConfigOption[] }>('session/new', { cwd: this.#wt!.path, mcpServers: [] })
+    this.#sessionId = created.sessionId
+    let options = created.configOptions ?? []
+    if (this.#isTerminal()) return
+    if (this.#req.model) options = await this.#setOption('model', this.#req.model, options)
+    if (this.#isTerminal()) return
+    if (this.#req.effort) options = await this.#setOption('effort', this.#req.effort, options)
+  }
+
+  /** A handshake request that cannot hang forever: a silent agent fails the task instead of stalling `starting`. */
+  async #hs<T>(method: string, params: unknown): Promise<T> {
+    let timer: NodeJS.Timeout | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new HandshakeTimeout(`${method} timed out after ${this.#handshakeTimeoutMs} ms`)), this.#handshakeTimeoutMs)
+    })
+    try {
+      return await Promise.race([this.#rpc!.request<T>(method, params), timeout])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   /** Sends a follow-up prompt. Only while idle; clears waitingOnUser. Resolves once the turn has started. */
@@ -102,7 +144,7 @@ export class Task {
     }
     this.#waitingOnUser = false
     this.#addThread(fromUser ? 'user' : 'claude', 'message', text)
-    void this.#runTurn(text)
+    this.#startTurn(text)
   }
 
   /** Resolves a pending permission or question with one of its options. */
@@ -131,7 +173,11 @@ export class Task {
     if (!wasTerminal) {
       this.#status = 'cancelled'
       this.#waitingOnUser = false
-      if (this.#sessionId) this.#rpc?.notify('session/cancel', { sessionId: this.#sessionId })
+      try {
+        if (this.#sessionId) this.#rpc?.notify('session/cancel', { sessionId: this.#sessionId })
+      } catch (err) {
+        console.error(`[task ${this.id}] session/cancel failed:`, err)
+      }
       this.#cancelPending()
       this.#changed()
     }
@@ -152,7 +198,7 @@ export class Task {
       filesTouched: [...this.#files],
       startedAt: this.#startedAt,
       updatedAt: this.#updatedAt,
-      costUsd: this.#costDone + this.#costTurn,
+      costUsd: this.#cost,
       pending: first?.pending,
       lastMessage: this.#lastMessage,
       waitingOnUser: this.#waitingOnUser,
@@ -213,6 +259,10 @@ export class Task {
     if (this.#stderr.length > STDERR_LINES) this.#stderr.splice(0, this.#stderr.length - STDERR_LINES)
   }
 
+  #stderrTail(): string {
+    return this.#stderr.length > 0 ? String.fromCharCode(10) + this.#stderr.join(String.fromCharCode(10)) : ''
+  }
+
   #flushStderr(): void {
     if (this.#stderrPartial.trim()) this.#stderr.push(this.#stderrPartial.slice(0, 500))
     this.#stderrPartial = ''
@@ -223,7 +273,7 @@ export class Task {
     this.#rpc?.close(new Error('agent exited'))
     if (this.#isTerminal()) return
     const how = code !== null ? `exit code ${code}` : `signal ${signal}`
-    const tail = this.#stderr.length > 0 ? `\n${this.#stderr.join('\n')}` : ''
+    const tail = this.#stderrTail()
     this.#fail(`${this.#spec.label} exited unexpectedly (${how})${tail}`)
   }
 
@@ -237,7 +287,8 @@ export class Task {
     const msg = errText(err)
     if (/RPC stream ended|agent exited/.test(msg)) await Promise.race([this.#closed, delay(3000)])
     if (this.#isTerminal()) return
-    this.#fail(`${context}: ${msg}`)
+    const tail = this.#stderrTail()
+    this.#fail(`${context}: ${msg}${tail}`)
   }
 
   #fail(text: string): void {
@@ -257,7 +308,7 @@ export class Task {
       return options
     }
     try {
-      const res = await this.#rpc!.request<{ configOptions?: ConfigOption[] }>('session/set_config_option', {
+      const res = await this.#hs<{ configOptions?: ConfigOption[] }>('session/set_config_option', {
         sessionId: this.#sessionId,
         configId,
         type: 'id',
@@ -267,7 +318,7 @@ export class Task {
       else this.#effort = value
       return res?.configOptions ?? options
     } catch (err) {
-      if (/RPC stream ended|agent exited/.test(errText(err))) throw err // the agent died: that is a setup failure
+      if (err instanceof HandshakeTimeout || /RPC stream ended|agent exited/.test(errText(err))) throw err // a hung or dead agent is a setup failure
       this.#addThread('bridge', 'error', `agent rejected ${configId}=${value}: ${errText(err)}`)
       return options
     }
@@ -275,11 +326,18 @@ export class Task {
 
   // ---- turns ----------------------------------------------------------------------------------------------------
 
+  /** Fire-and-forget turn: whatever goes wrong inside must fail the task, never escape as an unhandled rejection. */
+  #startTurn(text: string): void {
+    this.#runTurn(text).catch((err) => {
+      console.error(`[task ${this.id}] turn crashed:`, err)
+      this.#fail(`internal error: ${errText(err)}`)
+    })
+  }
+
   async #runTurn(text: string): Promise<void> {
+    this.#turnActive = true
     this.#status = 'running'
     this.#turnText = ''
-    this.#costDone += this.#costTurn
-    this.#costTurn = 0
     this.#changed()
     let stopReason: string | undefined
     try {
@@ -308,12 +366,19 @@ export class Task {
     }
     if (this.#isTerminal()) return
 
-    this.#status = 'idle'
+    this.#turnActive = false
+    const credits = this.#spec.id === 'commandcode' && isOutOfCredits(lastMessage)
+    if (credits) this.#status = 'out_of_credits'
+    // a permission request that arrived late keeps its own status until it is answered
+    else this.#status = this.#pendings.size === 0 ? 'idle' : this.#statusForPending()
     this.#changed()
     const body = lastMessage || `(the agent ended its turn without a message${stopReason && stopReason !== 'end_turn' ? `, stop reason ${stopReason}` : ''})`
     const text2 = refusal ? `${body}\n\nThe bridge could not commit this work: ${refusal}` : body
-    const credits = this.#spec.id === 'commandcode' && isOutOfCredits(lastMessage)
     this.#attention(credits ? 'out_of_credits' : 'turn_ended', text2)
+    if (credits) {
+      this.#cancelPending()
+      this.#kill()
+    }
   }
 
   async #onPromptError(err: unknown): Promise<void> {
@@ -352,14 +417,14 @@ export class Task {
     this.#status = this.#statusForPending()
     this.#changed()
     const opts = pending.options.map((o) => `${o.optionId}: ${o.name}`).join('; ')
-    const detail = isQuestion ? '' : ` [${pending.toolKind ?? 'unknown'}] ${JSON.stringify(pending.rawInput ?? null).slice(0, 500)}`
+    const detail = isQuestion ? '' : ` [${pending.toolKind ?? 'unknown'}] ${preview(pending.rawInput)}`
     this.#attention(isQuestion ? 'question' : 'permission', `${pending.title}${detail}\nrequest ${requestId}; options: ${opts}`)
     return answered // never times out: the agent waits as long as the human needs
   }
 
   #statusForPending(): TaskStatus {
     const first = this.#pendings.values().next().value as PendingEntry | undefined
-    if (!first) return 'running'
+    if (!first) return this.#turnActive ? 'running' : 'idle'
     return first.pending.type === 'question' ? 'asking' : 'waiting_permission'
   }
 
@@ -390,7 +455,7 @@ export class Task {
       case 'usage_update': {
         const amount = u.cost?.amount
         if (typeof amount === 'number' && (u.cost.currency === undefined || u.cost.currency === 'USD')) {
-          this.#costTurn = amount
+          this.#cost = amount
           this.#changed()
         }
         return

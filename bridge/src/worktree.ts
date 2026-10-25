@@ -221,14 +221,14 @@ async function ignoredDirs(dir: string, rels: string[]): Promise<Set<string>> {
   return new Set(r.stdout.split('\0').filter(Boolean).map((p) => p.replace(/^\.\//, '')))
 }
 
-const isInside = (root: string, p: string) => {
+export const isInside = (root: string, p: string) => {
   const r = process.platform === 'win32' ? root.toLowerCase() : root
   const c = process.platform === 'win32' ? p.toLowerCase() : p
   return c === r || c.startsWith(r.endsWith(sep) ? r : r + sep)
 }
 
 /** A `.git` path component, in any case, and with the trailing dots/spaces Windows strips from names. */
-const isDotGit = (name: string) => name.toLowerCase().replace(/[. ]+$/, '') === '.git'
+export const isDotGit = (name: string) => name.toLowerCase().replace(/[. ]+$/, '') === '.git'
 
 type Findings = { nested: string[]; dirLinks: string[]; outside: string[] }
 

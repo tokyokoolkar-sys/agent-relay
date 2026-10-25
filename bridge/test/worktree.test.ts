@@ -1,11 +1,31 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { existsSync } from 'node:fs'
-import { readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { RelayError, assertRepo, commitAll, createWorktree, diff, isDirty, merge } from '../src/worktree.ts'
 import { cleanupRepos, git, makePlainDir, makeRepo } from './helpers.ts'
 
-afterEach(cleanupRepos)
+const failMergeAbort = vi.hoisted(() => ({ on: false }))
+
+// Pass-through wrapper so one test can make `git merge --abort` fail on demand.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>()
+  const execFile = ((file: string, args: string[], ...rest: any[]) => {
+    if (failMergeAbort.on && args.includes('--abort')) {
+      const cb = rest.at(-1) as (err: Error, stdout: string, stderr: string) => void
+      queueMicrotask(() => cb(Object.assign(new Error('simulated'), { code: 128 }), '', 'fatal: simulated abort failure'))
+      return undefined as never
+    }
+    return (actual.execFile as any)(file, args, ...rest)
+  }) as typeof actual.execFile
+  return { ...actual, execFile }
+})
+
+afterEach(async () => {
+  failMergeAbort.on = false
+  await cleanupRepos()
+})
 
 const norm = (p: string) => resolve(p).replaceAll('\\', '/').toLowerCase()
 
@@ -119,5 +139,83 @@ describe('merge', () => {
     expect(res).toEqual({ ok: false, reason: 'conflict', paths: ['README.md'] })
     expect(await git(repo, 'status', '--porcelain')).toBe('')
     expect(await readFile(join(repo, 'README.md'), 'utf8')).toBe('line one\nfrom A\n')
+  })
+})
+
+const fwd = (p: string) => p.replaceAll('\\', '/')
+
+describe('hostile worktree', () => {
+  it('rejects a tampered worktree .git pointer', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const other = await mkdtemp(join(tmpdir(), 'relay-evil-'))
+    try {
+      await rm(join(wt.path, '.git')) // hidden on Windows, so replace rather than overwrite
+      await writeFile(join(wt.path, '.git'), `gitdir: ${fwd(other)}\n`)
+      await writeFile(join(wt.path, 'new.txt'), 'x\n')
+      await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'worktree_tampered' })
+      await expect(isDirty(wt.path)).rejects.toMatchObject({ code: 'worktree_tampered' })
+    } finally {
+      await rm(other, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a worktree whose .git was replaced by a directory', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    await rm(join(wt.path, '.git'))
+    await git(wt.path, 'init')
+    await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'worktree_tampered' })
+  })
+
+  it('ignores a configured fsmonitor and repository hooks', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const dir = await mkdtemp(join(tmpdir(), 'relay-marks-'))
+    try {
+      const fmMarker = join(dir, 'fsmonitor-ran')
+      const hookMarker = join(dir, 'hook-ran')
+      const script = join(dir, 'touch.js')
+      await writeFile(script, `require('node:fs').writeFileSync(process.argv[2], 'x'); process.stdout.write('\\0')`)
+      await git(repo, 'config', 'core.fsmonitor', `"${fwd(process.execPath)}" "${fwd(script)}" "${fwd(fmMarker)}"`)
+      await writeFile(join(repo, '.git', 'hooks', 'pre-commit'), `#!/bin/sh\ntouch "${fwd(hookMarker)}"\n`)
+      await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+      expect(await commitAll(wt.path, 'add new file')).toBe(true)
+      expect(existsSync(fmMarker)).toBe(false)
+      expect(existsSync(hookMarker)).toBe(false)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('reports a failing git merge --abort instead of returning conflict', async () => {
+    const repo = await makeRepo()
+    const a = await createWorktree(repo, 'oc-1')
+    const b = await createWorktree(repo, 'oc-2')
+    await writeFile(join(a.path, 'README.md'), 'line one\nfrom A\n')
+    await commitAll(a.path, 'A edits')
+    await writeFile(join(b.path, 'README.md'), 'line one\nfrom B\n')
+    await commitAll(b.path, 'B edits')
+    await merge(repo, a.branch, 'Merge oc-1')
+    failMergeAbort.on = true
+    await expect(merge(repo, b.branch, 'Merge oc-2')).rejects.toMatchObject({ code: 'merge_abort_failed' })
+    failMergeAbort.on = false
+    await git(repo, 'merge', '--abort')
+  })
+
+  it('returns unquoted paths for non-ASCII file names in conflicts', async () => {
+    const repo = await makeRepo()
+    const name = 'café.txt'
+    await writeFile(join(repo, name), 'base\n')
+    await git(repo, 'add', '-A')
+    await git(repo, 'commit', '-m', 'add cafe')
+    const a = await createWorktree(repo, 'oc-1')
+    const b = await createWorktree(repo, 'oc-2')
+    await writeFile(join(a.path, name), 'A\n')
+    await commitAll(a.path, 'A')
+    await writeFile(join(b.path, name), 'B\n')
+    await commitAll(b.path, 'B')
+    await merge(repo, a.branch, 'm1')
+    expect(await merge(repo, b.branch, 'm2')).toEqual({ ok: false, reason: 'conflict', paths: [name] })
   })
 })

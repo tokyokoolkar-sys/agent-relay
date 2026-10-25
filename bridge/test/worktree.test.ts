@@ -2,16 +2,24 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
-import { RelayError, assertRepo, commitAll, createWorktree, diff, isDirty, merge, resolveGit } from '../src/worktree.ts'
+import { dirname, join, resolve } from 'node:path'
+import { GIT_TIMEOUT_MS, RelayError, assertRepo, commitAll, createWorktree, diff, isDirty, merge, resolveGit } from '../src/worktree.ts'
 import { cleanupRepos, git, makePlainDir, makeRepo } from './helpers.ts'
 
 const failMergeAbort = vi.hoisted(() => ({ on: false }))
+const hangGit = vi.hoisted(() => ({ on: false, timeouts: [] as unknown[] }))
 
-// Pass-through wrapper so one test can make `git merge --abort` fail on demand.
+// Pass-through wrapper so tests can make `git merge --abort` fail, or make git hang, on demand.
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
   const execFile = ((file: string, args: string[], ...rest: any[]) => {
+    if (hangGit.on) {
+      // Stand-in for a git that never finishes: a sleeping node process, run with the caller's options except
+      // for a tiny timeout, so the real kill-on-timeout path runs.
+      const [opts, cb] = rest as [Record<string, unknown>, (...a: any[]) => void]
+      hangGit.timeouts.push(opts.timeout)
+      return (actual.execFile as any)(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { ...opts, timeout: 300 }, cb)
+    }
     if (failMergeAbort.on && args.includes('--abort')) {
       const cb = rest.at(-1) as (err: Error, stdout: string, stderr: string) => void
       queueMicrotask(() => cb(Object.assign(new Error('simulated'), { code: 128 }), '', 'fatal: simulated abort failure'))
@@ -24,6 +32,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 afterEach(async () => {
   failMergeAbort.on = false
+  hangGit.on = false
   await cleanupRepos()
 })
 
@@ -84,9 +93,9 @@ describe('commitAll and diff', () => {
     expect(await isDirty(wt.path)).toBe(false)
     await writeFile(join(wt.path, 'new.txt'), 'hello\n')
     expect(await isDirty(wt.path)).toBe(true)
-    expect(await commitAll(wt.path, 'add new file')).toBe(true)
+    expect(await commitAll(wt.path, 'add new file', wt.base)).toBe(true)
     expect(await isDirty(wt.path)).toBe(false)
-    expect(await commitAll(wt.path, 'again')).toBe(false)
+    expect(await commitAll(wt.path, 'again', wt.base)).toBe(false)
     expect(await git(wt.path, 'log', '-1', '--format=%an <%ae>')).toBe('Agent Relay <relay@localhost>')
   })
 
@@ -94,7 +103,7 @@ describe('commitAll and diff', () => {
     const repo = await makeRepo()
     const wt = await createWorktree(repo, 'oc-1')
     await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-    await commitAll(wt.path, 'add new file')
+    await commitAll(wt.path, 'add new file', wt.base)
     const d = await diff(repo, wt.base, wt.branch)
     expect(d.stat).toContain('new.txt')
     expect(d.patch).toContain('+hello')
@@ -106,7 +115,7 @@ describe('merge', () => {
     const repo = await makeRepo()
     const wt = await createWorktree(repo, 'oc-1')
     await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-    await commitAll(wt.path, 'add new file')
+    await commitAll(wt.path, 'add new file', wt.base)
     const res = await merge(repo, wt.branch, 'Merge oc-1')
     expect(res.ok).toBe(true)
     if (res.ok) expect(res.commit).toBe(await git(repo, 'rev-parse', 'HEAD'))
@@ -119,7 +128,7 @@ describe('merge', () => {
     const repo = await makeRepo()
     const wt = await createWorktree(repo, 'oc-1')
     await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-    await commitAll(wt.path, 'add new file')
+    await commitAll(wt.path, 'add new file', wt.base)
     await writeFile(join(repo, 'README.md'), 'uncommitted\n')
     const res = await merge(repo, wt.branch, 'Merge oc-1')
     expect(res).toMatchObject({ ok: false, reason: 'dirty' })
@@ -131,9 +140,9 @@ describe('merge', () => {
     const a = await createWorktree(repo, 'oc-1')
     const b = await createWorktree(repo, 'oc-2')
     await writeFile(join(a.path, 'README.md'), 'line one\nfrom A\n')
-    await commitAll(a.path, 'A edits')
+    await commitAll(a.path, 'A edits', a.base)
     await writeFile(join(b.path, 'README.md'), 'line one\nfrom B\n')
-    await commitAll(b.path, 'B edits')
+    await commitAll(b.path, 'B edits', b.base)
     expect((await merge(repo, a.branch, 'Merge oc-1')).ok).toBe(true)
     const res = await merge(repo, b.branch, 'Merge oc-2')
     expect(res).toEqual({ ok: false, reason: 'conflict', paths: ['README.md'] })
@@ -153,7 +162,7 @@ describe('hostile worktree', () => {
       await rm(join(wt.path, '.git')) // hidden on Windows, so replace rather than overwrite
       await writeFile(join(wt.path, '.git'), `gitdir: ${fwd(other)}\n`)
       await writeFile(join(wt.path, 'new.txt'), 'x\n')
-      await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'worktree_tampered' })
+      await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'worktree_tampered' })
       await expect(isDirty(wt.path)).rejects.toMatchObject({ code: 'worktree_tampered' })
     } finally {
       await rm(other, { recursive: true, force: true })
@@ -165,7 +174,7 @@ describe('hostile worktree', () => {
     const wt = await createWorktree(repo, 'oc-1')
     await rm(join(wt.path, '.git'))
     await git(wt.path, 'init')
-    await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'worktree_tampered' })
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'worktree_tampered' })
   })
 
   it('ignores a configured fsmonitor and repository hooks', async () => {
@@ -180,7 +189,7 @@ describe('hostile worktree', () => {
       await git(repo, 'config', 'core.fsmonitor', `"${fwd(process.execPath)}" "${fwd(script)}" "${fwd(fmMarker)}"`)
       await writeFile(join(repo, '.git', 'hooks', 'pre-commit'), `#!/bin/sh\ntouch "${fwd(hookMarker)}"\n`)
       await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-      expect(await commitAll(wt.path, 'add new file')).toBe(true)
+      expect(await commitAll(wt.path, 'add new file', wt.base)).toBe(true)
       expect(existsSync(fmMarker)).toBe(false)
       expect(existsSync(hookMarker)).toBe(false)
     } finally {
@@ -193,9 +202,9 @@ describe('hostile worktree', () => {
     const a = await createWorktree(repo, 'oc-1')
     const b = await createWorktree(repo, 'oc-2')
     await writeFile(join(a.path, 'README.md'), 'line one\nfrom A\n')
-    await commitAll(a.path, 'A edits')
+    await commitAll(a.path, 'A edits', a.base)
     await writeFile(join(b.path, 'README.md'), 'line one\nfrom B\n')
-    await commitAll(b.path, 'B edits')
+    await commitAll(b.path, 'B edits', b.base)
     await merge(repo, a.branch, 'Merge oc-1')
     failMergeAbort.on = true
     await expect(merge(repo, b.branch, 'Merge oc-2')).rejects.toMatchObject({ code: 'merge_abort_failed' })
@@ -212,9 +221,9 @@ describe('hostile worktree', () => {
     const a = await createWorktree(repo, 'oc-1')
     const b = await createWorktree(repo, 'oc-2')
     await writeFile(join(a.path, name), 'A\n')
-    await commitAll(a.path, 'A')
+    await commitAll(a.path, 'A', a.base)
     await writeFile(join(b.path, name), 'B\n')
-    await commitAll(b.path, 'B')
+    await commitAll(b.path, 'B', b.base)
     await merge(repo, a.branch, 'm1')
     expect(await merge(repo, b.branch, 'm2')).toEqual({ ok: false, reason: 'conflict', paths: [name] })
   })
@@ -241,7 +250,7 @@ describe('embedded repositories, git resolution, hooks, textconv', () => {
       await git(nested, 'config', 'filter.x.clean', `"${fwd(process.execPath)}" "${fwd(script)}" "${fwd(marker)}"`)
       await writeFile(join(nested, '.gitattributes'), 'f filter=x\n')
       await writeFile(join(nested, 'f'), 'payload\n')
-      await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub/nested/.git') })
+      await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub/nested/.git') })
       await expect(isDirty(wt.path)).resolves.toBeTypeOf('boolean')
       expect(existsSync(marker)).toBe(false)
       expect(await git(wt.path, 'ls-files', '-s')).not.toContain('160000')
@@ -256,7 +265,7 @@ describe('embedded repositories, git resolution, hooks, textconv', () => {
     const wt = await createWorktree(repo, 'oc-1')
     await mkdir(join(wt.path, 'deep'))
     await writeFile(join(wt.path, 'deep', '.git'), 'gitdir: ../elsewhere\n')
-    await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'nested_repo' })
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo' })
   })
 
   it('finds git by absolute path from PATH and ignores a planted git.exe in the worktree', async () => {
@@ -271,7 +280,7 @@ describe('embedded repositories, git resolution, hooks, textconv', () => {
     if (process.platform === 'win32') await copyFile(join(process.env.SystemRoot ?? 'C:/Windows', 'System32', 'whoami.exe'), join(wt.path, 'git.exe'))
     else await writeFile(join(wt.path, 'git.exe'), 'not an executable')
     await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-    expect(await commitAll(wt.path, 'add files')).toBe(true)
+    expect(await commitAll(wt.path, 'add files', wt.base)).toBe(true)
     expect(await git(wt.path, 'show', '--stat', '--format=', 'HEAD')).toContain('git.exe')
   })
 
@@ -284,7 +293,7 @@ describe('embedded repositories, git resolution, hooks, textconv', () => {
         await writeFile(join(repo, '.git', 'hooks', hook), `#!/bin/sh\ntouch "${fwd(join(dir, hook))}"\n`)
       }
       await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-      expect(await commitAll(wt.path, 'add new file')).toBe(true)
+      expect(await commitAll(wt.path, 'add new file', wt.base)).toBe(true)
       expect((await merge(repo, wt.branch, 'Merge oc-1')).ok).toBe(true)
       for (const hook of ['pre-commit', 'post-commit', 'post-merge', 'prepare-commit-msg', 'commit-msg', 'pre-merge-commit']) {
         expect(existsSync(join(dir, hook)), hook).toBe(false)
@@ -305,7 +314,7 @@ describe('embedded repositories, git resolution, hooks, textconv', () => {
       await git(repo, 'config', 'diff.x.textconv', `"${fwd(process.execPath)}" "${fwd(script)}" "${fwd(marker)}"`)
       await writeFile(join(repo, '.gitattributes'), '*.txt diff=x\n')
       await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-      await commitAll(wt.path, 'add new file')
+      await commitAll(wt.path, 'add new file', wt.base)
       const d = await diff(repo, wt.base, wt.branch)
       expect(d.patch).toContain('+hello')
       expect(existsSync(marker)).toBe(false)
@@ -320,7 +329,7 @@ describe('embedded repositories, git resolution, hooks, textconv', () => {
     const wt = await createWorktree(repo, 'oc-1')
     await mkdir(join(wt.path, 'sub'))
     await writeFile(join(wt.path, 'sub', '.GIT'), 'gitdir: ../elsewhere\n')
-    await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'nested_repo' })
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo' })
   })
 
   it('refuses a junction pointing outside the worktree and stages nothing from it', async () => {
@@ -333,37 +342,199 @@ describe('embedded repositories, git resolution, hooks, textconv', () => {
       await writeFile(join(outside, 'secret.txt'), 'top secret\n')
       await symlink(outside, link, 'junction')
       await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-      await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'link_outside_worktree', message: expect.stringContaining('j') })
+      await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'directory_link', message: expect.stringContaining('j') })
       expect(await git(wt.path, 'ls-files')).not.toContain('secret.txt')
       expect(await git(wt.path, 'ls-tree', '-r', '--name-only', wt.branch)).not.toContain('secret.txt')
-      // a link that stays inside the worktree is fine to scan past (its target is a plain directory)
+      // once the link is gone, an ordinary directory commits fine
       await rm(link, { recursive: true, force: true })
       await mkdir(join(wt.path, 'real'))
       await writeFile(join(wt.path, 'real', 'a.txt'), 'a\n')
-      expect(await commitAll(wt.path, 'ok')).toBe(true)
+      expect(await commitAll(wt.path, 'ok', wt.base)).toBe(true)
     } finally {
       await rm(link, { recursive: true, force: true })
       await rm(outside, { recursive: true, force: true })
     }
   })
+})
 
-  it('allows a submodule already tracked in the base commit', async () => {
-    const { mkdir } = await fs()
+/** A submodule in the base commit, with its git dir at `<common-dir>/modules/sub` (as `git submodule` lays it out). */
+async function repoWithSubmodule() {
+  const { mkdir } = await import('node:fs/promises')
+  const repo = await makeRepo()
+  const modules = join(repo, '.git', 'modules', 'sub')
+  await mkdir(dirname(modules))
+  const src = await makePlainDir()
+  await git(src, 'init', '-b', 'main', `--separate-git-dir=${modules}`)
+  await git(src, '-c', 'user.name=S', '-c', 'user.email=s@localhost', 'commit', '--allow-empty', '-m', 'sub')
+  const subSha = await git(src, 'rev-parse', 'HEAD')
+  await git(repo, 'update-index', '--add', '--cacheinfo', `160000,${subSha},sub`)
+  await git(repo, 'commit', '-m', 'add submodule gitlink')
+  const wt = await createWorktree(repo, 'oc-1')
+  await mkdir(join(wt.path, 'sub'), { recursive: true })
+  return { repo, wt, src, modules, subSha }
+}
+
+describe('submodules are judged against the base commit', () => {
+  it('refuses a gitlink the agent committed itself (moved HEAD), via the scan and via the post-add backstop', async () => {
+    const { mkdir } = await import('node:fs/promises')
     const repo = await makeRepo()
-    const sha = await git(repo, 'rev-parse', 'HEAD')
-    await git(repo, 'update-index', '--add', '--cacheinfo', `160000,${sha},sub`)
-    await git(repo, 'commit', '-m', 'add submodule gitlink')
     const wt = await createWorktree(repo, 'oc-1')
-    await mkdir(join(wt.path, 'sub'), { recursive: true })
-    // an initialised submodule checkout: a real repo at the tracked gitlink path
-    await git(join(wt.path, 'sub'), 'init', '-b', 'main')
-    await git(join(wt.path, 'sub'), '-c', 'user.name=S', '-c', 'user.email=s@localhost', 'commit', '--allow-empty', '-m', 'sub')
+    const evil = join(wt.path, 'evil')
+    await mkdir(evil)
+    await git(evil, 'init', '-b', 'main')
+    await git(evil, '-c', 'user.name=E', '-c', 'user.email=e@localhost', 'commit', '--allow-empty', '-m', 'evil')
+    // the agent stages and commits the embedded repo with its own git, moving the worktree's HEAD
+    await git(wt.path, 'add', 'evil')
+    await git(wt.path, '-c', 'user.name=E', '-c', 'user.email=e@localhost', 'commit', '-m', 'agent commit')
+    expect(await git(wt.path, 'ls-tree', 'HEAD', 'evil')).toContain('160000 commit')
     await writeFile(join(wt.path, 'new.txt'), 'hello\n')
-    expect(await commitAll(wt.path, 'add new file')).toBe(true)
-    expect(await git(wt.path, 'ls-tree', 'HEAD', 'sub')).toContain('160000 commit')
-    // a second, new nested repo is still refused
-    await mkdir(join(wt.path, 'other'))
-    await writeFile(join(wt.path, 'other', '.git'), 'gitdir: ../elsewhere\n')
-    await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('other/.git') })
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('evil/.git') })
+    // with the repo removed the scan sees nothing, but the gitlink is still in HEAD and the index
+    await rm(join(evil, '.git'), { recursive: true, force: true })
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('evil') })
+  })
+
+  it('allows a base submodule checked out through a gitfile into <common-dir>/modules/', async () => {
+    const { wt, modules, subSha } = await repoWithSubmodule()
+    await writeFile(join(wt.path, 'sub', '.git'), `gitdir: ${fwd(modules)}\n`)
+    await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+    expect(await commitAll(wt.path, 'add new file', wt.base)).toBe(true)
+    expect(await git(wt.path, 'ls-tree', 'HEAD', 'sub')).toContain(`160000 commit ${subSha}`)
+  })
+
+  it('refuses a .git directory at a base gitlink path', async () => {
+    const { wt } = await repoWithSubmodule()
+    await git(join(wt.path, 'sub'), 'init', '-b', 'main')
+    await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub/.git') })
+  })
+
+  it('refuses a gitfile at a base gitlink path that points outside <common-dir>/modules/', async () => {
+    const { wt } = await repoWithSubmodule()
+    const elsewhere = await makePlainDir()
+    await git(elsewhere, 'init', '-b', 'main')
+    await writeFile(join(wt.path, 'sub', '.git'), `gitdir: ${fwd(join(elsewhere, '.git'))}\n`)
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub/.git') })
+  })
+
+  it('refuses a base submodule whose checked-out sha moved away from base', async () => {
+    const { wt, src, modules } = await repoWithSubmodule()
+    await writeFile(join(wt.path, 'sub', '.git'), `gitdir: ${fwd(modules)}\n`)
+    await git(src, '-c', 'user.name=S', '-c', 'user.email=s@localhost', 'commit', '--allow-empty', '-m', 'moved')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub') })
+  })
+
+  it('rejects a base that is not a full sha', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    await expect(commitAll(wt.path, 'nope', 'HEAD')).rejects.toMatchObject({ code: 'bad_base' })
+    await expect(commitAll(wt.path, 'nope', '--output=x')).rejects.toMatchObject({ code: 'bad_base' })
+  })
+})
+
+describe('directory links, ignored trees, timeouts', () => {
+  const fs = () => import('node:fs/promises')
+
+  it('refuses cyclic junctions quickly, without following them', async () => {
+    const { mkdir, symlink } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const a = join(wt.path, 'a')
+    await mkdir(a)
+    await writeFile(join(a, 'f.txt'), 'x\n')
+    await symlink(a, join(a, 'b'), 'junction')
+    await symlink(a, join(a, 'c'), 'junction') // two cycles: git add -A would grow exponentially
+    const started = Date.now()
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'directory_link', message: expect.stringMatching(/a\/b.*a\/c|a\/c.*a\/b/) })
+    expect(Date.now() - started).toBeLessThan(10_000)
+    expect(await git(wt.path, 'ls-files')).not.toContain('a/')
+  })
+
+  it('refuses a junction whose target is inside the worktree', async () => {
+    const { mkdir, symlink } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    await mkdir(join(wt.path, 'real'))
+    await writeFile(join(wt.path, 'real', 'a.txt'), 'a\n')
+    await symlink(join(wt.path, 'real'), join(wt.path, 'alias'), 'junction')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'directory_link', message: expect.stringContaining('alias') })
+  })
+
+  it('refuses a file symlink pointing outside the worktree', async () => {
+    const { symlink } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const outside = await makePlainDir()
+    await writeFile(join(outside, 'secret.txt'), 'top secret\n')
+    try {
+      await symlink(join(outside, 'secret.txt'), join(wt.path, 'leak.txt'), 'file')
+    } catch (err) {
+      // file symlinks need Developer Mode or elevation on Windows
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') return
+      throw err
+    }
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'link_outside_worktree', message: expect.stringContaining('leak.txt') })
+  })
+
+  it('skips gitignored directories entirely: links and repos inside node_modules/ are not refused or committed', async () => {
+    const { mkdir, symlink } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const outside = await makePlainDir()
+    await writeFile(join(outside, 'secret.txt'), 'top secret\n')
+    await writeFile(join(wt.path, '.gitignore'), 'node_modules/\n')
+    const nm = join(wt.path, 'node_modules')
+    await mkdir(join(nm, 'pkg'), { recursive: true })
+    await writeFile(join(nm, 'pkg', 'index.js'), 'module.exports = 1\n')
+    await symlink(outside, join(nm, 'linked'), 'junction')
+    await symlink(nm, join(nm, 'pkg', 'cycle'), 'junction')
+    await git(join(nm, 'pkg'), 'init', '-b', 'main')
+    await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+    expect(await commitAll(wt.path, 'add new file', wt.base)).toBe(true)
+    const tree = await git(wt.path, 'ls-tree', '-r', '--name-only', 'HEAD')
+    expect(tree).toContain('new.txt')
+    expect(tree).toContain('.gitignore')
+    expect(tree).not.toContain('node_modules')
+    expect(tree).not.toContain('secret.txt')
+  })
+
+  it('still scans an ignored directory that holds tracked files (git add enters it)', async () => {
+    const { mkdir, symlink } = await fs()
+    const repo = await makeRepo()
+    await mkdir(join(repo, 'vendor'))
+    await writeFile(join(repo, 'vendor', 'kept.txt'), 'kept\n')
+    await git(repo, 'add', '-A')
+    await git(repo, 'commit', '-m', 'vendor')
+    const wt = await createWorktree(repo, 'oc-1')
+    await writeFile(join(wt.path, '.gitignore'), 'vendor/\n')
+    const outside = await makePlainDir()
+    await symlink(outside, join(wt.path, 'vendor', 'linked'), 'junction')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'directory_link', message: expect.stringContaining('vendor/linked') })
+  })
+
+  // ':' cannot appear in Windows file names, so this can only be exercised elsewhere.
+  it.skipIf(process.platform === 'win32')('handles directory names that look like pathspec magic', async () => {
+    const { mkdir, symlink } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    await writeFile(join(wt.path, '.gitignore'), 'ignored/\n')
+    await mkdir(join(wt.path, ':(exclude)x'))
+    await symlink(join(wt.path, ':(exclude)x'), join(wt.path, ':(exclude)x', 'loop'), 'dir')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'directory_link' })
+  })
+
+  it('kills a git call that does not finish and rejects with git_timeout', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    hangGit.timeouts.length = 0
+    hangGit.on = true
+    const started = Date.now()
+    await expect(isDirty(wt.path)).rejects.toMatchObject({ code: 'git_timeout' })
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'git_timeout' })
+    hangGit.on = false
+    expect(Date.now() - started).toBeLessThan(10_000)
+    expect(GIT_TIMEOUT_MS).toBe(120_000)
+    expect(hangGit.timeouts.length).toBeGreaterThan(0)
+    expect(hangGit.timeouts.every((t) => t === GIT_TIMEOUT_MS)).toBe(true)
   })
 })

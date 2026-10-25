@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process'
-import { appendFile, lstat, mkdir, mkdtemp, readFile, realpath } from 'node:fs/promises'
+import { statSync } from 'node:fs'
+import { appendFile, lstat, mkdir, readFile, readdir, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 export class RelayError extends Error {
   code: string
@@ -16,12 +17,27 @@ type GitResult = { code: number; stdout: string; stderr: string }
 
 const IDENTITY = ['-c', 'user.name=Agent Relay', '-c', 'user.email=relay@localhost', '-c', 'commit.gpgsign=false']
 
-let emptyHooksDir: Promise<string> | undefined
+// Hooks are disabled outright: pointing hooksPath at the null device means no hook of any kind (post-commit etc.) can run.
+const NO_HOOKS = process.platform === 'win32' ? 'NUL' : '/dev/null'
 
-/** An empty directory used as core.hooksPath so no repository hook ever runs inside the bridge. */
-function noHooksDir(): Promise<string> {
-  emptyHooksDir ??= mkdtemp(join(tmpdir(), 'relay-nohooks-')).then((d) => d.replaceAll('\\', '/'))
-  return emptyHooksDir
+let gitExe: string | undefined
+
+/**
+ * Absolute path of the git executable, found by searching PATH entries only (never the current directory,
+ * which for a worktree is agent-writable and which Windows would otherwise search first). Cached.
+ */
+export function resolveGit(): string {
+  if (gitExe) return gitExe
+  const exts = process.platform === 'win32' ? ['.exe', '.com'] : ['']
+  for (const raw of (process.env.PATH ?? '').split(delimiter)) {
+    const dir = raw.trim().replace(/^"(.*)"$/, '$1')
+    if (!dir || !isAbsolute(dir)) continue
+    for (const ext of exts) {
+      const candidate = join(dir, `git${ext}`)
+      if (statSync(candidate, { throwIfNoEntry: false })?.isFile()) return (gitExe = candidate)
+    }
+  }
+  throw new RelayError('git_not_found', 'could not find git on PATH')
 }
 
 const sameFile = (a: string, b: string) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b)
@@ -39,7 +55,7 @@ async function trustedWorktreeGitDir(dir: string): Promise<string | undefined> {
   const repo = dirname(relayDir)
 
   const tampered = (why: string) => new RelayError('worktree_tampered', `refusing to run git in ${wt}: ${why}`)
-  const common = await execGit(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+  const common = await execGit(['-C', repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'])
   if (common.code !== 0) throw new RelayError('git_failed', `could not locate the git dir of ${repo}: ${common.stderr.trim()}`)
   const expected = await realpath(join(common.stdout.trim(), 'worktrees', basename(wt))).catch(() => undefined)
   if (!expected) throw tampered('no matching administrative directory in the main repository')
@@ -54,38 +70,45 @@ async function trustedWorktreeGitDir(dir: string): Promise<string | undefined> {
   return expected
 }
 
-/** Bare git invocation: no shell, hardened config and environment, exit code reported rather than thrown. */
-function execGit(cwd: string, args: string[]): Promise<GitResult> {
-  return noHooksDir().then(
-    (hooks) =>
-      new Promise<GitResult>((resolvePromise) => {
-        const full = ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${hooks}`, '-c', 'core.quotePath=false', ...args]
-        execFile(
-          'git',
-          full,
-          { cwd, windowsHide: true, maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } },
-          (err, stdout, stderr) => {
-            const code = err ? (typeof err.code === 'number' ? err.code : -1) : 0
-            resolvePromise({ code, stdout, stderr: err && typeof err.code !== 'number' ? `${err.message}\n${stderr}` : stderr })
-          },
-        )
-      }),
-  )
+/**
+ * Bare git invocation: absolute git path, no shell, hardened config and environment, exit code reported rather
+ * than thrown. The process cwd is always the OS temp dir (never agent-writable repo content); the target is
+ * selected by `-C` / `--git-dir` / `--work-tree` in `args`.
+ */
+function execGit(args: string[]): Promise<GitResult> {
+  return new Promise<GitResult>((resolvePromise) => {
+    const full = [
+      '-c', 'core.fsmonitor=false',
+      '-c', `core.hooksPath=${NO_HOOKS}`,
+      '-c', 'core.quotePath=false',
+      '-c', 'diff.ignoreSubmodules=all',
+      ...args,
+    ]
+    execFile(
+      resolveGit(),
+      full,
+      { cwd: tmpdir(), windowsHide: true, maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } },
+      (err, stdout, stderr) => {
+        const code = err ? (typeof err.code === 'number' ? err.code : -1) : 0
+        resolvePromise({ code, stdout, stderr: err && typeof err.code !== 'number' ? `${err.message}\n${stderr}` : stderr })
+      },
+    )
+  })
 }
 
 /**
- * Runs git in `cwd`. Inside a relay worktree the git dir is pinned explicitly (after verifying the `.git`
+ * Runs git against `dir`. Inside a relay worktree the git dir is pinned explicitly (after verifying the `.git`
  * pointer), so nothing the agent wrote there can redirect git. Never rejects on a non-zero exit: callers
  * inspect `code` (stderr noise like CRLF warnings is not failure).
  */
-async function run(cwd: string, args: string[]): Promise<GitResult> {
-  const gitDir = await trustedWorktreeGitDir(cwd)
-  return execGit(cwd, gitDir ? [`--git-dir=${gitDir}`, `--work-tree=${resolve(cwd)}`, ...args] : args)
+async function run(dir: string, args: string[]): Promise<GitResult> {
+  const gitDir = await trustedWorktreeGitDir(dir)
+  return execGit(gitDir ? [`--git-dir=${gitDir}`, `--work-tree=${resolve(dir)}`, ...args] : ['-C', resolve(dir), ...args])
 }
 
 /** Like run, but throws a RelayError when git exits non-zero. */
-async function must(cwd: string, args: string[]): Promise<string> {
-  const r = await run(cwd, args)
+async function must(dir: string, args: string[]): Promise<string> {
+  const r = await run(dir, args)
   if (r.code !== 0) throw new RelayError('git_failed', `git ${args[0]} failed: ${r.stderr.trim() || `exit ${r.code}`}`)
   return r.stdout
 }
@@ -119,19 +142,47 @@ export async function createWorktree(repo: string, taskId: string): Promise<{ pa
 
 /** Throws RelayError('worktree_tampered') when `dir` is a relay worktree whose `.git` pointer was altered. */
 export async function isDirty(dir: string): Promise<boolean> {
-  return (await must(dir, ['status', '--porcelain'])).trim() !== ''
+  return (await must(dir, ['status', '--porcelain', '--ignore-submodules=all'])).trim() !== ''
 }
 
-/** Stages and commits everything as Agent Relay. Returns false when there was nothing to commit. */
+/** Every `.git` file or directory strictly below `root` (an embedded repository), as forward-slash relative paths. */
+async function findNestedGit(root: string): Promise<string[]> {
+  const found: string[] = []
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name)
+      if (entry.name === '.git') {
+        if (dir !== root) found.push(relative(root, full).replaceAll('\\', '/'))
+        continue
+      }
+      if (entry.isDirectory()) await walk(full) // symlinks are not directories here, so they are never followed
+    }
+  }
+  await walk(root)
+  return found
+}
+
+/**
+ * Stages and commits everything as Agent Relay. Returns false when there was nothing to commit.
+ * Refuses (RelayError 'nested_repo') when the tree contains an embedded git repository: its own config could
+ * run code (filter drivers) when git recurses into it, and it would be recorded as a gitlink anyway.
+ */
 export async function commitAll(dir: string, message: string): Promise<boolean> {
+  const nested = await findNestedGit(resolve(dir))
+  if (nested.length > 0) throw new RelayError('nested_repo', `embedded git repositories are not allowed: ${nested.join(', ')}`)
   await must(dir, ['add', '-A'])
+  const gitlinks = (await must(dir, ['ls-files', '-s', '-z'])).split('\0').filter((entry) => entry.startsWith('160000 '))
+  if (gitlinks.length > 0) {
+    const paths = gitlinks.map((entry) => entry.slice(entry.indexOf('\t') + 1))
+    throw new RelayError('nested_repo', `embedded git repositories are not allowed: ${paths.join(', ')}`)
+  }
   if (!(await isDirty(dir))) return false
   await must(dir, [...IDENTITY, 'commit', '--no-verify', '-m', message])
   return true
 }
 
 export async function diff(repo: string, base: string, branch: string): Promise<{ stat: string; patch: string }> {
-  const flags = ['diff', '--no-color', '--no-ext-diff']
+  const flags = ['diff', '--no-color', '--no-ext-diff', '--no-textconv']
   const [stat, patch] = await Promise.all([
     must(repo, [...flags, '--stat', base, branch, '--']),
     must(repo, [...flags, base, branch, '--']),

@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { RelayError, assertRepo, commitAll, createWorktree, diff, isDirty, merge } from '../src/worktree.ts'
+import { RelayError, assertRepo, commitAll, createWorktree, diff, isDirty, merge, resolveGit } from '../src/worktree.ts'
 import { cleanupRepos, git, makePlainDir, makeRepo } from './helpers.ts'
 
 const failMergeAbort = vi.hoisted(() => ({ on: false }))
@@ -217,5 +217,100 @@ describe('hostile worktree', () => {
     await commitAll(b.path, 'B')
     await merge(repo, a.branch, 'm1')
     expect(await merge(repo, b.branch, 'm2')).toEqual({ ok: false, reason: 'conflict', paths: [name] })
+  })
+})
+
+describe('embedded repositories, git resolution, hooks, textconv', () => {
+  const fs = () => import('node:fs/promises')
+
+  it('refuses a nested repo with a clean filter and never runs the filter', async () => {
+    const { mkdir } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const dir = await mkdtemp(join(tmpdir(), 'relay-marks-'))
+    try {
+      const marker = join(dir, 'filter-ran')
+      const script = join(dir, 'touch.js')
+      await writeFile(script, `require('node:fs').writeFileSync(process.argv[2], 'x'); process.stdout.write(require('node:fs').readFileSync(0))`)
+      const nested = join(wt.path, 'sub', 'nested')
+      await mkdir(nested, { recursive: true })
+      await git(nested, 'init', '-b', 'main')
+      await git(nested, 'config', 'user.name', 'Evil')
+      await git(nested, 'config', 'user.email', 'evil@localhost')
+      await git(nested, 'commit', '--allow-empty', '-m', 'init')
+      await git(nested, 'config', 'filter.x.clean', `"${fwd(process.execPath)}" "${fwd(script)}" "${fwd(marker)}"`)
+      await writeFile(join(nested, '.gitattributes'), 'f filter=x\n')
+      await writeFile(join(nested, 'f'), 'payload\n')
+      await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub/nested/.git') })
+      await expect(isDirty(wt.path)).resolves.toBeTypeOf('boolean')
+      expect(existsSync(marker)).toBe(false)
+      expect(await git(wt.path, 'ls-files', '-s')).not.toContain('160000')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a nested .git file as well as a directory', async () => {
+    const { mkdir } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    await mkdir(join(wt.path, 'deep'))
+    await writeFile(join(wt.path, 'deep', '.git'), 'gitdir: ../elsewhere\n')
+    await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'nested_repo' })
+  })
+
+  it('finds git by absolute path from PATH and ignores a planted git.exe in the worktree', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const exe = resolveGit()
+    expect(/(^|[\\/])git(\.exe)?$/i.test(exe)).toBe(true)
+    expect(existsSync(exe)).toBe(true)
+    expect(norm(exe).startsWith(`${norm(wt.path)}/`)).toBe(false)
+    expect(resolve(exe)).toBe(exe)
+    // A real (small) executable that is not git: if it were launched in place of git, commitAll would fail.
+    if (process.platform === 'win32') await copyFile(join(process.env.SystemRoot ?? 'C:/Windows', 'System32', 'whoami.exe'), join(wt.path, 'git.exe'))
+    else await writeFile(join(wt.path, 'git.exe'), 'not an executable')
+    await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+    expect(await commitAll(wt.path, 'add files')).toBe(true)
+    expect(await git(wt.path, 'show', '--stat', '--format=', 'HEAD')).toContain('git.exe')
+  })
+
+  it('runs no hooks of any kind (post-commit, post-merge)', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const dir = await mkdtemp(join(tmpdir(), 'relay-marks-'))
+    try {
+      for (const hook of ['pre-commit', 'post-commit', 'post-merge', 'prepare-commit-msg', 'commit-msg', 'pre-merge-commit']) {
+        await writeFile(join(repo, '.git', 'hooks', hook), `#!/bin/sh\ntouch "${fwd(join(dir, hook))}"\n`)
+      }
+      await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+      expect(await commitAll(wt.path, 'add new file')).toBe(true)
+      expect((await merge(repo, wt.branch, 'Merge oc-1')).ok).toBe(true)
+      for (const hook of ['pre-commit', 'post-commit', 'post-merge', 'prepare-commit-msg', 'commit-msg', 'pre-merge-commit']) {
+        expect(existsSync(join(dir, hook)), hook).toBe(false)
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('diff does not run textconv drivers', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const dir = await mkdtemp(join(tmpdir(), 'relay-marks-'))
+    try {
+      const marker = join(dir, 'textconv-ran')
+      const script = join(dir, 'touch.js')
+      await writeFile(script, `require('node:fs').writeFileSync(process.argv[2], 'x'); process.stdout.write(require('node:fs').readFileSync(process.argv[3]))`)
+      await git(repo, 'config', 'diff.x.textconv', `"${fwd(process.execPath)}" "${fwd(script)}" "${fwd(marker)}"`)
+      await writeFile(join(repo, '.gitattributes'), '*.txt diff=x\n')
+      await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+      await commitAll(wt.path, 'add new file')
+      const d = await diff(repo, wt.base, wt.branch)
+      expect(d.patch).toContain('+hello')
+      expect(existsSync(marker)).toBe(false)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

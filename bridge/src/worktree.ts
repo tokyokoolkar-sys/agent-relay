@@ -227,8 +227,16 @@ export const isInside = (root: string, p: string) => {
   return c === r || c.startsWith(r.endsWith(sep) ? r : r + sep)
 }
 
-/** A `.git` path component, in any case, and with the trailing dots/spaces Windows strips from names. */
-export const isDotGit = (name: string) => name.toLowerCase().replace(/[. ]+$/, '') === '.git'
+/**
+ * A `.git` path component under any spelling NTFS resolves to it: any case, trailing dots/spaces stripped, an
+ * alternate-data-stream suffix (`.git::$INDEX_ALLOCATION`, `.git::$DATA`), or the 8.3 short name `GIT~1`.
+ */
+export const isDotGit = (name: string) => {
+  const lower = name.toLowerCase()
+  const colon = lower.indexOf(':')
+  const base = (colon === -1 ? lower : lower.slice(0, colon)).replace(/[. ]+$/, '')
+  return base === '.git' || /^git~\d+$/.test(base)
+}
 
 type Findings = { nested: string[]; dirLinks: string[]; outside: string[] }
 

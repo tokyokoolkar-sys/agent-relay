@@ -1,7 +1,19 @@
-import { describe, expect, it } from 'vitest'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { classifyPermission, isInside, isOutOfCredits, type PermissionParams } from '../src/policy.ts'
+import { isDotGit } from '../src/worktree.ts'
 
-const WT = 'C:\\repo\\.relay\\wt\\cc-1'
+// A real directory: the policy checks the filesystem for links, and fails closed when the worktree does not exist.
+let base = ''
+let WT = ''
+beforeAll(() => {
+  base = realpathSync.native(mkdtempSync(join(tmpdir(), 'policy-')))
+  WT = join(base, 'wt')
+  mkdirSync(join(WT, 'sub'), { recursive: true })
+})
+afterAll(() => rmSync(base, { recursive: true, force: true }))
 
 const ccOptions = ['allow_once', 'allow_always', 'reject_once', 'reject_always'].map((k) => ({ optionId: k, name: k, kind: k }))
 const write = (file: string, extra: Partial<PermissionParams['toolCall']> = {}): PermissionParams => ({
@@ -88,7 +100,7 @@ describe('classifyPermission', () => {
   })
 
   it('auto-allows a read inside the worktree', () => {
-    const p = write(`${WT}\\a.txt`, { kind: 'read' })
+    const p = write(`${WT}\\a.txt`, { kind: 'read', rawInput: { file_path: `${WT}\\a.txt` } })
     expect(classifyPermission(p, WT, 'r').action).toBe('auto')
   })
 
@@ -105,6 +117,80 @@ describe('classifyPermission', () => {
     expect(classifyPermission(write(`${WT}\\sub\\.git.\\hooks\\x`), WT, 'r').action).toBe('claude')
     expect(classifyPermission(write(`${WT}/sub/.git /x`), WT, 'r').action).toBe('claude')
     expect(classifyPermission(write(`${WT}\\.gitignore`), WT, 'r').action).toBe('auto')
+  })
+
+  it.each([
+    ['new_path', 'C:\\elsewhere\\moved.txt'],
+    ['destination', 'C:\\elsewhere\\d.txt'],
+    ['paths', ['C:\\elsewhere\\d.txt']],
+    ['edits', [{ file_path: 'C:\\elsewhere\\d.txt' }]],
+    ['cwd', 'C:\\elsewhere'],
+    ['operation', 'delete'],
+    ['notebook_path', 'C:\\elsewhere\\n.ipynb'],
+  ])('escalates an edit carrying the unlisted rawInput key %s', (key, value) => {
+    const f = join(WT, 'a.txt')
+    expect(classifyPermission(write(f, { rawInput: { file_path: f, content: 'x', [key]: value } }), WT, 'r').action).toBe('claude')
+  })
+
+  it('escalates a read carrying an edit-only key', () => {
+    const f = join(WT, 'a.txt')
+    expect(classifyPermission(write(f, { kind: 'read', rawInput: { file_path: f, content: 'x' } }), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(f, { kind: 'read', rawInput: { file_path: f, offset: 1, limit: 5 } }), WT, 'r').action).toBe('auto')
+  })
+
+  it('escalates, without throwing, on malformed shapes', () => {
+    const f = join(WT, 'a.txt')
+    const bad = (mutate: (p: any) => void) => {
+      const p: any = write(f)
+      mutate(p)
+      const d = classifyPermission(p, WT, 'r')
+      expect(d.action).toBe('claude')
+    }
+    bad((p) => (p.toolCall.rawInput = 'file_path'))
+    bad((p) => (p.toolCall.rawInput = null))
+    bad((p) => (p.toolCall.rawInput = [f]))
+    bad((p) => (p.toolCall.locations = f))
+    bad((p) => (p.toolCall.locations = [{ nope: f }]))
+    bad((p) => (p.toolCall.locations = [null]))
+    bad((p) => (p.toolCall.locations = [{ path: 5 }]))
+    bad((p) => (p.options = undefined))
+    bad((p) => (p.options = 'allow_once'))
+    bad((p) => (p.toolCall = undefined))
+    bad((p) => (p.toolCall.rawInput = { file_path: 5 }))
+    expect(classifyPermission(undefined as any, WT, 'r').action).toBe('claude')
+    expect(classifyPermission({} as any, WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(f), undefined as any, 'r').action).toBe('claude')
+  })
+
+  it('escalates NTFS aliases of .git and other aliasing spellings', () => {
+    for (const rel of ['.git::$DATA', '.git::$INDEX_ALLOCATION\\config', 'GIT~1\\config', 'sub\\git~2\\x', 'sub\\.git.\\x', 'sub\\.GIT \\x']) {
+      expect(classifyPermission(write(`${WT}\\${rel}`), WT, 'r').action, rel).toBe('claude')
+    }
+    expect(classifyPermission(write(`${WT}\\sub\\a.txt::$DATA`), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(`${WT}\\sub\\a.txt:stream`), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(`${WT}\\LONGFI~1.txt`), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(`file://${WT}/a.txt`), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write('C:foo.txt'), WT, 'r').action).toBe('claude')
+  })
+
+  it('escalates a path reached through a junction pointing outside the worktree, and allows a normal nested dir', () => {
+    const outside = join(base, 'outside')
+    mkdirSync(outside, { recursive: true })
+    symlinkSync(outside, join(WT, 'j'), 'junction')
+    expect(classifyPermission(write(join(WT, 'j', 'x.txt')), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write('j/x.txt'), WT, 'r').action).toBe('claude')
+    // an existing file reached through the link, and the link itself
+    writeFileSync(join(outside, 'e.txt'), 'x')
+    expect(classifyPermission(write(join(WT, 'j', 'e.txt')), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(join(WT, 'j')), WT, 'r').action).toBe('claude')
+    // normal nested directory, existing and not yet existing
+    expect(classifyPermission(write(join(WT, 'sub', 'x.txt')), WT, 'r').action).toBe('auto')
+    expect(classifyPermission(write(join(WT, 'sub', 'new', 'deeper', 'x.txt')), WT, 'r').action).toBe('auto')
+  })
+
+  it('fails closed when the worktree does not exist', () => {
+    const gone = join(base, 'nope')
+    expect(classifyPermission(write(join(gone, 'a.txt')), gone, 'r').action).toBe('claude')
   })
 
   it('sends the OpenCode shell payload to Claude', () => {
@@ -141,10 +227,19 @@ describe.runIf(process.platform === 'win32')('isInside (win32)', () => {
 })
 
 describe('isOutOfCredits', () => {
-  it.each(['Insufficient credits for deepseek/deepseek-v4-pro.', 'Premium credits exhausted', 'Usage limit reached'])('detects %s', (t) => {
+  it.each(['Insufficient credits for deepseek/deepseek-v4-pro.', 'Premium credits exhausted', 'Usage limit reached', 'usage limit for your plan'])('detects %s', (t) => {
     expect(isOutOfCredits(t)).toBe(true)
   })
-  it('ignores ordinary text', () => {
-    expect(isOutOfCredits('all tests passed')).toBe(false)
+  it.each(['all tests passed', 'Rate limit exceeded, retry in 20s', 'out of credits', 'quota exceeded'])('ignores %s', (t) => {
+    expect(isOutOfCredits(t)).toBe(false)
+  })
+})
+
+describe('isDotGit', () => {
+  it.each(['.git', '.GIT', '.git.', '.git ', '.git::$DATA', '.git::$INDEX_ALLOCATION', '.Git:x', 'GIT~1', 'git~12', 'GIT~1.'])('matches %s', (n) => {
+    expect(isDotGit(n)).toBe(true)
+  })
+  it.each(['.gitignore', '.github', 'git', 'git~', 'a.git', 'GIT~x', ''])('does not match %s', (n) => {
+    expect(isDotGit(n)).toBe(false)
   })
 })

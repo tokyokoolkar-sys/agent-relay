@@ -7,18 +7,19 @@ import { GIT_TIMEOUT_MS, RelayError, assertRepo, commitAll, createWorktree, diff
 import { cleanupRepos, git, makePlainDir, makeRepo } from './helpers.ts'
 
 const failMergeAbort = vi.hoisted(() => ({ on: false }))
-const hangGit = vi.hoisted(() => ({ on: false, timeouts: [] as unknown[] }))
+const hangGit = vi.hoisted(() => ({ on: false, pidFile: '' }))
 
 // Pass-through wrapper so tests can make `git merge --abort` fail, or make git hang, on demand.
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
   const execFile = ((file: string, args: string[], ...rest: any[]) => {
-    if (hangGit.on) {
-      // Stand-in for a git that never finishes: a sleeping node process, run with the caller's options except
-      // for a tiny timeout, so the real kill-on-timeout path runs.
-      const [opts, cb] = rest as [Record<string, unknown>, (...a: any[]) => void]
-      hangGit.timeouts.push(opts.timeout)
-      return (actual.execFile as any)(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { ...opts, timeout: 300 }, cb)
+    if (hangGit.on && /(^|[\\/])git(\.exe)?$/i.test(file)) {
+      // Stand-in for a git that never finishes and, like Git for Windows' cmd\git.exe launcher, runs the real
+      // work in a child of its own: a sleeping node process that starts a sleeping grandchild and records its PID.
+      const script =
+        "const c = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore', detached: true });" +
+        "require('fs').writeFileSync(process.argv[1], String(c.pid)); setTimeout(() => {}, 60000)"
+      return (actual.execFile as any)(process.execPath, ['-e', script, hangGit.pidFile], ...rest)
     }
     if (failMergeAbort.on && args.includes('--abort')) {
       const cb = rest.at(-1) as (err: Error, stdout: string, stderr: string) => void
@@ -392,14 +393,29 @@ describe('submodules are judged against the base commit', () => {
     // with the repo removed the scan sees nothing, but the gitlink is still in HEAD and the index
     await rm(join(evil, '.git'), { recursive: true, force: true })
     await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('evil') })
+    // the refused staging was rolled back to HEAD
+    expect(await git(wt.path, 'diff', '--cached', '--name-only')).toBe('')
+    expect(await git(wt.path, 'ls-files')).not.toContain('new.txt')
   })
 
-  it('allows a base submodule checked out through a gitfile into <common-dir>/modules/', async () => {
-    const { wt, modules, subSha } = await repoWithSubmodule()
+  it('refuses a gitfile at a base gitlink path, even one into <common-dir>/modules/', async () => {
+    const { wt, modules } = await repoWithSubmodule()
     await writeFile(join(wt.path, 'sub', '.git'), `gitdir: ${fwd(modules)}\n`)
+    await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub/.git') })
+  })
+
+  it('keeps an uninitialised base gitlink, refuses one restaged at another sha, and restores the index', async () => {
+    const { wt, subSha } = await repoWithSubmodule()
     await writeFile(join(wt.path, 'new.txt'), 'hello\n')
     expect(await commitAll(wt.path, 'add new file', wt.base)).toBe(true)
     expect(await git(wt.path, 'ls-tree', 'HEAD', 'sub')).toContain(`160000 commit ${subSha}`)
+    // the agent points the gitlink elsewhere with its own git
+    await git(wt.path, 'update-index', '--cacheinfo', `160000,${wt.base},sub`)
+    await writeFile(join(wt.path, 'more.txt'), 'more\n')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub') })
+    expect(await git(wt.path, 'ls-files', '-s', 'sub')).toContain(subSha)
+    expect(await git(wt.path, 'diff', '--cached', '--name-only')).toBe('')
   })
 
   it('refuses a .git directory at a base gitlink path', async () => {
@@ -415,13 +431,6 @@ describe('submodules are judged against the base commit', () => {
     await git(elsewhere, 'init', '-b', 'main')
     await writeFile(join(wt.path, 'sub', '.git'), `gitdir: ${fwd(join(elsewhere, '.git'))}\n`)
     await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub/.git') })
-  })
-
-  it('refuses a base submodule whose checked-out sha moved away from base', async () => {
-    const { wt, src, modules } = await repoWithSubmodule()
-    await writeFile(join(wt.path, 'sub', '.git'), `gitdir: ${fwd(modules)}\n`)
-    await git(src, '-c', 'user.name=S', '-c', 'user.email=s@localhost', 'commit', '--allow-empty', '-m', 'moved')
-    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('sub') })
   })
 
   it('rejects a base that is not a full sha', async () => {
@@ -523,18 +532,97 @@ describe('directory links, ignored trees, timeouts', () => {
     await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'directory_link' })
   })
 
-  it('kills a git call that does not finish and rejects with git_timeout', async () => {
+  /**
+   * The agent ignores a tracked directory, renames it to another case (so a case-sensitive lookup of the index
+   * misses it) and swaps a subdirectory for a junction to outside content under a tracked file name.
+   */
+  async function caseRenameAttack(trackedDir: string, ignoreFile: string, pattern: string) {
+    const { mkdir, rename, symlink } = await fs()
+    const repo = await makeRepo()
+    await mkdir(join(repo, trackedDir, 'b'), { recursive: true })
+    await writeFile(join(repo, trackedDir, 'b', 'c.txt'), 'kept\n')
+    await git(repo, 'add', '-A')
+    await git(repo, 'commit', '-m', 'tracked dir')
+    const wt = await createWorktree(repo, 'oc-1')
+    const outside = await makePlainDir()
+    await writeFile(join(outside, 'c.txt'), 'OUTSIDE-SECRET\n')
+    const indexBefore = await git(wt.path, 'ls-files', '-s')
+    await writeFile(join(wt.path, ignoreFile), `${pattern}\n`)
+    const parent = join(wt.path, trackedDir, '..')
+    const name = trackedDir.split('/').at(-1)!
+    await rename(join(parent, name), join(parent, `${name}.tmp`))
+    await rename(join(parent, `${name}.tmp`), join(parent, name.toUpperCase()))
+    const renamed = join(parent, name.toUpperCase())
+    await rm(join(renamed, 'b'), { recursive: true, force: true })
+    await symlink(outside, join(renamed, 'b'), 'junction')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'directory_link', message: expect.stringMatching(/\/b\b/i) })
+    expect(await git(wt.path, 'show', `${wt.branch}:${trackedDir}/b/c.txt`)).toBe('kept')
+    expect(await git(wt.path, 'diff', '--cached', '--name-only')).toBe('')
+    expect(await git(wt.path, 'ls-files', '-s')).toBe(indexBefore)
+    expect(await git(wt.path, 'log', '--format=%s', `${wt.base}..${wt.branch}`)).toBe('')
+  }
+
+  it.skipIf(process.platform !== 'win32' && process.platform !== 'darwin')(
+    'refuses a case-renamed, ignored tracked directory whose subdirectory became an outside junction',
+    () => caseRenameAttack('src', '.gitignore', 'src/'),
+  )
+
+  it.skipIf(process.platform !== 'win32' && process.platform !== 'darwin')(
+    'refuses the same attack one level deeper with the ignore rule in a nested .gitignore',
+    () => caseRenameAttack('pkg/src', 'pkg/.gitignore', 'src/'),
+  )
+
+  it('kills the process tree of a git call that does not finish and rejects with git_timeout', async () => {
     const repo = await makeRepo()
     const wt = await createWorktree(repo, 'oc-1')
-    hangGit.timeouts.length = 0
+    hangGit.pidFile = join(await makePlainDir(), 'grandchild.pid')
+    const tick = () => new Promise((r) => setImmediate(r)) // setImmediate is not faked
+    const pause = async (ms: number) => {
+      for (const until = Date.now() + ms; Date.now() < until; ) await tick()
+    }
+    let grandchild = 0
     hangGit.on = true
-    const started = Date.now()
-    await expect(isDirty(wt.path)).rejects.toMatchObject({ code: 'git_timeout' })
-    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'git_timeout' })
-    hangGit.on = false
-    expect(Date.now() - started).toBeLessThan(10_000)
-    expect(GIT_TIMEOUT_MS).toBe(120_000)
-    expect(hangGit.timeouts.length).toBeGreaterThan(0)
-    expect(hangGit.timeouts.every((t) => t === GIT_TIMEOUT_MS)).toBe(true)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      let settled = false
+      const outcome = isDirty(wt.path).then(
+        () => undefined,
+        (err: unknown) => err,
+      ).finally(() => (settled = true))
+      // wait (in real time, without timers) until the fake git's grandchild is running
+      const deadline = Date.now() + 10_000
+      while (!(grandchild = Number(existsSync(hangGit.pidFile) && (await readFile(hangGit.pidFile, 'utf8'))))) {
+        if (Date.now() > deadline) throw new Error('fake git did not start')
+        await tick()
+      }
+      await vi.advanceTimersByTimeAsync(GIT_TIMEOUT_MS - 1)
+      await pause(300)
+      expect(settled).toBe(false) // not killed before the timeout
+      await vi.advanceTimersByTimeAsync(1)
+      vi.useRealTimers()
+      expect(await outcome).toMatchObject({ code: 'git_timeout' })
+      expect(GIT_TIMEOUT_MS).toBe(120_000)
+      if (process.platform === 'win32') {
+        // the launcher's own child died with it (taskkill /T on our child's PID)
+        const alive = () => {
+          try {
+            process.kill(grandchild, 0)
+            return true
+          } catch {
+            return false
+          }
+        }
+        for (const until = Date.now() + 5_000; alive() && Date.now() < until; ) await new Promise((r) => setTimeout(r, 50))
+        expect(alive()).toBe(false)
+      }
+    } finally {
+      vi.useRealTimers()
+      hangGit.on = false
+      if (grandchild) {
+        try {
+          process.kill(grandchild) // only if the test failed: our own stray sleeper, by PID
+        } catch {}
+      }
+    }
   })
 })

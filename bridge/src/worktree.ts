@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { type ChildProcess, execFile } from 'node:child_process'
 import { statSync } from 'node:fs'
 import { appendFile, lstat, mkdir, readFile, readdir, realpath, stat as statPath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -87,21 +87,15 @@ function execGit(args: string[], input?: string): Promise<GitResult> {
       '-c', 'diff.ignoreSubmodules=all',
       ...args,
     ]
+    let timedOut = false
     const child = execFile(
       resolveGit(),
       full,
-      {
-        cwd: tmpdir(),
-        windowsHide: true,
-        maxBuffer: 256 * 1024 * 1024,
-        timeout: GIT_TIMEOUT_MS,
-        killSignal: 'SIGKILL',
-        env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' },
-      },
+      { cwd: tmpdir(), windowsHide: true, maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } },
       (err, stdout, stderr) => {
-        // `killed` is set when Node killed the child: the timeout, or an exceeded maxBuffer (reported by code).
-        if (err?.killed && err.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-          const what = args.filter((a) => !a.startsWith('--git-dir=') && !a.startsWith('--work-tree=') && a !== '-C')
+        clearTimeout(timer)
+        if (timedOut) {
+          const what = args.filter((a, i) => !a.startsWith('--git-dir=') && !a.startsWith('--work-tree=') && a !== '-C' && args[i - 1] !== '-C')
           reject(new RelayError('git_timeout', `git ${what.slice(0, 3).join(' ')} did not finish within ${GIT_TIMEOUT_MS} ms and was killed`))
           return
         }
@@ -109,10 +103,30 @@ function execGit(args: string[], input?: string): Promise<GitResult> {
         resolvePromise({ code, stdout, stderr: err && typeof err.code !== 'number' ? `${err.message}\n${stderr}` : stderr })
       },
     )
+    const timer = setTimeout(() => {
+      timedOut = true
+      if (child) killTree(child)
+    }, GIT_TIMEOUT_MS)
     if (child?.stdin) {
       child.stdin.on('error', () => {}) // git may exit before reading all input; its exit code tells the story
       child.stdin.end(input ?? '')
     }
+  })
+}
+
+/**
+ * Kills our own child and everything it started. On Windows `<git>\cmd\git.exe` is a launcher that runs the real
+ * git as a child of its own, so killing only the launcher would orphan it: kill the tree of our child's PID with
+ * taskkill (absolute path, never by image name), falling back to a plain kill if that fails.
+ */
+function killTree(child: ChildProcess): void {
+  if (process.platform !== 'win32' || child.pid === undefined) {
+    child.kill('SIGKILL')
+    return
+  }
+  const taskkill = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
+  execFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), windowsHide: true }, (err) => {
+    if (err) child.kill('SIGKILL')
   })
 }
 
@@ -176,11 +190,19 @@ async function baseGitlinks(dir: string, base: string): Promise<Map<string, stri
   return links
 }
 
-/** Directories (forward-slash, relative) that contain at least one index entry. */
+/** Case-insensitive file systems (the defaults on Windows and macOS): path comparisons fold case. */
+const FOLD_CASE = process.platform === 'win32' || process.platform === 'darwin'
+const fold = (p: string) => (FOLD_CASE ? p.toLowerCase() : p)
+
+/**
+ * Directories (forward-slash, relative, case-folded where the file system folds case) that contain at least one
+ * index entry. Folded because the index says `src/` while the agent may have renamed the directory to `SRC/`:
+ * git add still reaches the tracked paths through it.
+ */
 async function indexDirs(dir: string): Promise<Set<string>> {
   const dirs = new Set<string>()
   for (const p of (await must(dir, ['ls-files', '-z'])).split('\0')) {
-    for (let i = p.indexOf('/'); i !== -1; i = p.indexOf('/', i + 1)) dirs.add(p.slice(0, i))
+    for (let i = p.indexOf('/'); i !== -1; i = p.indexOf('/', i + 1)) dirs.add(fold(p.slice(0, i)))
   }
   return dirs
 }
@@ -205,43 +227,29 @@ const isInside = (root: string, p: string) => {
   return c === r || c.startsWith(r.endsWith(sep) ? r : r + sep)
 }
 
-type ScanContext = {
-  /** Gitlinks recorded in the base commit: path -> sha. */
-  exempt: Map<string, string>
-  /** realpath of `<common-dir>/modules`, when it exists. */
-  modulesDir: string | undefined
-  /**
-   * Directories holding index entries: git add enters these even when they are ignored. check-ignore already
-   * declines to report such a directory; this keeps the rule explicit rather than relying on that.
-   */
-  trackedDirs: Set<string>
+/** A `.git` path component, in any case, and with the trailing dots/spaces Windows strips from names. */
+const isDotGit = (name: string) => name.toLowerCase().replace(/[. ]+$/, '') === '.git'
+
+type Findings = { nested: string[]; dirLinks: string[]; outside: string[] }
+
+function refusal(f: Findings): RelayError | undefined {
+  if (f.nested.length > 0) return new RelayError('nested_repo', `embedded git repositories are not allowed: ${f.nested.join(', ')}`)
+  if (f.dirLinks.length > 0) return new RelayError('directory_link', `directory links (junctions, directory symlinks) are not allowed: ${f.dirLinks.join(', ')}`)
+  if (f.outside.length > 0) return new RelayError('link_outside_worktree', `links pointing outside the worktree are not allowed: ${f.outside.join(', ')}`)
+  return undefined
 }
 
 /**
- * A `.git` at a base-commit gitlink path is accepted only as a regular gitfile whose gitdir resolves strictly
- * inside `<common-dir>/modules/` (outside the agent-writable worktree). A `.git` directory, a link, or a gitfile
- * pointing anywhere else is a repository the agent made.
+ * Pre-add scan, an early refusal before anything is staged (the post-add check in commitAll is the real defence).
+ * Breadth-first, never following links, skipping directories git add does not enter: excluded by git's ignore
+ * rules and holding no index entry in any case variant. Forward-slash relative paths.
+ * `nested`: any `.git` entry (any case) below the root, a submodule checkout included (worktrees never have
+ * submodules initialised). `dirLinks`: every junction or directory symlink, wherever it points. `outside`: file
+ * links whose real target lies outside the worktree.
  */
-async function isSubmoduleGitfile(full: string, isFile: boolean, ctx: ScanContext): Promise<boolean> {
-  if (!isFile || !ctx.modulesDir) return false
-  const match = /^gitdir:\s*(.+?)\s*$/.exec((await readFile(full, 'utf8')).trim())
-  if (!match) return false
-  const target = await realpath(resolve(dirname(full), match[1]!)).catch(() => undefined)
-  return !!target && isInside(ctx.modulesDir, target) && !sameFile(target, ctx.modulesDir)
-}
-
-/**
- * Pre-add scan of an agent-writable worktree: breadth-first, never following links, and skipping directories
- * git add does not enter (excluded by git's ignore rules and holding no index entries). Forward-slash relative paths.
- * `nested`: `.git` entries (any case) below the root, except a submodule gitfile at a base gitlink path.
- * `dirLinks`: every directory link (junction or directory symlink), wherever it points: git add follows them,
- * out of the worktree or round a cycle. `outside`: file links whose real target lies outside the worktree.
- */
-async function scanWorktree(dir: string, ctx: ScanContext): Promise<{ nested: string[]; dirLinks: string[]; outside: string[] }> {
+async function scanWorktree(dir: string, trackedDirs: Set<string>): Promise<Findings> {
   const root = resolve(dir)
-  const nested: string[] = []
-  const dirLinks: string[] = []
-  const outside: string[] = []
+  const found: Findings = { nested: [], dirLinks: [], outside: [] }
   const realRoot = await realpath(root)
   const rel = (p: string) => relative(root, p).replaceAll('\\', '/')
   let level = [root]
@@ -250,24 +258,87 @@ async function scanWorktree(dir: string, ctx: ScanContext): Promise<{ nested: st
     for (const parent of level) {
       for (const entry of await readdir(parent, { withFileTypes: true })) {
         const full = join(parent, entry.name)
-        if (entry.name.toLowerCase() === '.git') {
-          if (parent === root) continue // the worktree pointer, verified by trustedWorktreeGitDir
-          if (!(ctx.exempt.has(rel(parent)) && (await isSubmoduleGitfile(full, entry.isFile(), ctx)))) nested.push(rel(full))
+        if (isDotGit(entry.name)) {
+          if (parent !== root) found.nested.push(rel(full)) // the root's is the pointer trustedWorktreeGitDir verified
           continue
         }
         if (entry.isSymbolicLink()) {
           const target = await statPath(full).catch(() => undefined) // a dangling link stages as plain link text
-          if (target?.isDirectory()) dirLinks.push(rel(full))
-          else if (target && !isInside(realRoot, await realpath(full))) outside.push(rel(full))
+          if (target?.isDirectory()) found.dirLinks.push(rel(full))
+          else if (target && !isInside(realRoot, await realpath(full))) found.outside.push(rel(full))
         } else if (entry.isDirectory()) {
           subdirs.push(full)
         }
       }
     }
-    const ignored = await ignoredDirs(dir, subdirs.map(rel).filter((r) => !ctx.trackedDirs.has(r)))
+    const ignored = await ignoredDirs(dir, subdirs.map(rel).filter((r) => !trackedDirs.has(fold(r))))
     level = subdirs.filter((d) => !ignored.has(rel(d)))
   }
-  return { nested, dirLinks, outside }
+  return found
+}
+
+type StagedEntry = { mode: string; sha: string; path: string }
+
+/** The index as `ls-files -s -z` reports it: "<mode> <sha> <stage>\t<path>". */
+async function stagedEntries(dir: string): Promise<StagedEntry[]> {
+  return (await must(dir, ['ls-files', '-s', '-z']))
+    .split('\0')
+    .filter(Boolean)
+    .map((e) => {
+      const tab = e.indexOf('\t')
+      const [mode, sha] = e.slice(0, tab).split(' ')
+      return { mode: mode!, sha: sha!, path: e.slice(tab + 1) }
+    })
+}
+
+/**
+ * Checks what `git add` actually staged, independently of the scan and of any ignore rule: every index entry (not
+ * only changed ones; one cached lstat per directory plus one realpath per entry, run 32 at a time, stays well
+ * under a second for a few thousand files). An entry is refused when a path component is `.git`, when it is a
+ * gitlink that `base` does not have at that sha, when one of its ancestor directories is a link, or when its
+ * real path is outside the worktree.
+ */
+async function verifyStaged(dir: string, entries: StagedEntry[], exempt: Map<string, string>): Promise<Findings> {
+  const root = resolve(dir)
+  const realRoot = await realpath(root)
+  const nested = new Set<string>()
+  const dirLinks = new Set<string>()
+  const outside = new Set<string>()
+  const linkDirs = new Map<string, Promise<boolean>>()
+  const isLinkDir = (rel: string) => {
+    let known = linkDirs.get(rel)
+    if (!known) {
+      known = lstat(join(root, rel)).then(
+        (st) => st.isSymbolicLink(),
+        (err: NodeJS.ErrnoException) => {
+          if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return false
+          throw err
+        },
+      )
+      linkDirs.set(rel, known)
+    }
+    return known
+  }
+  const check = async ({ mode, sha, path }: StagedEntry) => {
+    const parts = path.split('/')
+    if (parts.some(isDotGit)) nested.add(path)
+    if (mode === '160000' && exempt.get(path) !== sha) nested.add(path)
+    for (let i = 1; i < parts.length; i++) {
+      const ancestor = parts.slice(0, i).join('/')
+      if (await isLinkDir(ancestor)) dirLinks.add(ancestor)
+    }
+    const real = await realpath(join(root, path)).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return undefined // not on disk (e.g. skip-worktree): nothing read
+      throw err
+    })
+    if (real && !isInside(realRoot, real)) outside.add(path)
+  }
+  let next = 0
+  const worker = async () => {
+    while (next < entries.length) await check(entries[next++]!)
+  }
+  await Promise.all(Array.from({ length: Math.min(32, entries.length) }, worker))
+  return { nested: [...nested], dirLinks: [...dirLinks], outside: [...outside] }
 }
 
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
@@ -275,31 +346,36 @@ const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
 /**
  * Stages and commits everything as Agent Relay. Returns false when there was nothing to commit.
  * `base` is the sha `createWorktree` recorded. It, not the worktree's HEAD (which the agent can move by
- * committing), decides which submodules are legitimate. Refuses, before anything is staged:
- * - RelayError('nested_repo'): an embedded git repository (its own config could run code, e.g. filter drivers).
- *   Only a gitlink present in `base`, checked out through a gitfile into `<common-dir>/modules/`, is allowed.
- * - RelayError('directory_link'): any junction or directory symlink outside gitignored directories.
- * - RelayError('link_outside_worktree'): a file link whose target is outside the worktree.
- * After staging, a gitlink that is not in `base` at base's sha is refused as 'nested_repo'.
+ * committing), decides which gitlinks are legitimate.
+ *
+ * After `add -A` the staged set itself is verified (see verifyStaged). On any violation the index is restored
+ * with `read-tree HEAD` and commitAll throws, so nothing reaches a commit. A pre-add scan refuses the same
+ * things earlier, before anything is staged. Errors:
+ * - RelayError('nested_repo'): a `.git` anywhere below the root (file, directory or link, submodule paths
+ *   included), or a staged gitlink that is not in `base` at base's sha.
+ * - RelayError('directory_link'): a junction or directory symlink (outside gitignored directories), or a staged
+ *   path that goes through one.
+ * - RelayError('link_outside_worktree'): a file link, or staged path, whose real target is outside the worktree.
  */
 export async function commitAll(dir: string, message: string, base: string): Promise<boolean> {
   if (!SHA.test(base)) throw new RelayError('bad_base', `base must be a full commit sha, got ${JSON.stringify(base)}`)
   const exempt = await baseGitlinks(dir, base)
-  const common = (await must(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).trim()
-  const modulesDir = await realpath(join(common, 'modules')).catch(() => undefined)
-  const { nested, dirLinks, outside } = await scanWorktree(dir, { exempt, modulesDir, trackedDirs: await indexDirs(dir) })
-  if (nested.length > 0) throw new RelayError('nested_repo', `embedded git repositories are not allowed: ${nested.join(', ')}`)
-  if (dirLinks.length > 0) throw new RelayError('directory_link', `directory links (junctions, directory symlinks) are not allowed: ${dirLinks.join(', ')}`)
-  if (outside.length > 0) throw new RelayError('link_outside_worktree', `links pointing outside the worktree are not allowed: ${outside.join(', ')}`)
+  const early = refusal(await scanWorktree(dir, await indexDirs(dir)))
+  if (early) throw early
   await must(dir, ['add', '-A'])
-  // Backstop for anything the scan missed, and for gitlinks the agent staged or committed itself: every staged
-  // gitlink must be one of base's, at base's sha. Entries are "<mode> <sha> <stage>\t<path>".
-  const added = (await must(dir, ['ls-files', '-s', '-z']))
-    .split('\0')
-    .filter((e) => e.startsWith('160000 '))
-    .filter((e) => exempt.get(e.slice(e.indexOf('\t') + 1)) !== e.split(' ')[1])
-    .map((e) => e.slice(e.indexOf('\t') + 1))
-  if (added.length > 0) throw new RelayError('nested_repo', `embedded git repositories are not allowed: ${added.join(', ')}`)
+  const restoreIndex = () => run(dir, ['read-tree', 'HEAD'])
+  let late: RelayError | undefined
+  try {
+    late = refusal(await verifyStaged(dir, await stagedEntries(dir), exempt))
+  } catch (err) {
+    await restoreIndex().catch(() => undefined) // a check that could not finish must not leave the staging behind
+    throw err
+  }
+  if (late) {
+    const restored = await restoreIndex()
+    if (restored.code !== 0) late.message += ` (restoring the index with read-tree HEAD failed: ${restored.stderr.trim() || `exit ${restored.code}`})`
+    throw late
+  }
   if (!(await isDirty(dir))) return false
   await must(dir, [...IDENTITY, 'commit', '--no-verify', '-m', message])
   return true

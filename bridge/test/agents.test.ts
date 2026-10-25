@@ -15,7 +15,7 @@ describe('agentSpec', () => {
     expect(s.short).toBe('oc')
     expect(s.command.replaceAll('\\', '/').endsWith('@opencode/cli/bin/opencode.exe')).toBe(true)
     expect(s.args).toEqual(['acp'])
-    expect(JSON.parse(s.env.OPENCODE_CONFIG_CONTENT!)).toEqual({ permission: { edit: 'allow', bash: 'ask', webfetch: 'ask' } })
+    expect(JSON.parse(s.env.OPENCODE_CONFIG_CONTENT!)).toEqual({ permission: { edit: 'ask', bash: 'ask', webfetch: 'ask', external_directory: 'ask' } })
   })
 
   it('builds the Command Code spec on node, never a shim', () => {

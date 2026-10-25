@@ -119,7 +119,7 @@ function execGit(args: string[], input?: string): Promise<GitResult> {
  * git as a child of its own, so killing only the launcher would orphan it: kill the tree of our child's PID with
  * taskkill (absolute path, never by image name), falling back to a plain kill if that fails.
  */
-function killTree(child: ChildProcess): void {
+export function killTree(child: ChildProcess): void {
   if (process.platform !== 'win32' || child.pid === undefined) {
     child.kill('SIGKILL')
     return

@@ -13,7 +13,7 @@ export type AgentSpec = {
 
 export const AGENT_IDS: readonly AgentId[] = ['opencode', 'commandcode']
 
-const OPENCODE_CONFIG = { permission: { edit: 'allow', bash: 'ask', webfetch: 'ask' } }
+const OPENCODE_CONFIG = { permission: { edit: 'ask', bash: 'ask', webfetch: 'ask', external_directory: 'ask' } }
 
 /** How to launch an agent's ACP server. Spawns the real binaries, never the .ps1/.cmd shims. */
 export function agentSpec(id: AgentId, npmRoot: string): AgentSpec {

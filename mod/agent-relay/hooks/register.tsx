@@ -1,0 +1,526 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register } from 'claude-code'
+
+import type { ActivityEntry, AgentId, AttentionReason, BridgeState, TaskSummary } from '../types'
+
+// The agent relay: one bridge process per session (bridge/src/main.ts, run with
+// node), its stdout events folded into state, and the relay tools Claude calls
+// served over the bridge's HTTP API on 127.0.0.1.
+
+const DEFAULT_BRIDGE_PATH = 'E:/ataspace/aiPlayground/Communication/bridge/src/main.ts'
+const ACTIVITY_CAP = 200
+const WAKE_CAP = 600
+const STOPPED_TOAST = 'Agent relay bridge stopped'
+const REVIEW_HINT = ' Review with relay_status / relay_diff.'
+
+const AGENTS: readonly AgentId[] = ['opencode', 'commandcode']
+const LABELS: Record<AgentId, string> = { opencode: 'OpenCode', commandcode: 'Command Code' }
+const SHORT_IDS: Record<string, AgentId> = { oc: 'opencode', cc: 'commandcode' }
+
+const tasksAtom = atom({ plugin: 'agent-relay', key: 'tasks' } as const, [])
+const bridgeAtom = atom({ plugin: 'agent-relay', key: 'bridge' } as const, { status: 'starting' })
+const expandedAtom = atom({ plugin: 'agent-relay', key: 'expanded' } as const, null)
+const activityAtom = atom({ plugin: 'agent-relay', key: 'activity' } as const, {})
+
+type $ = EngineInterface
+
+/** The running bridge, in module memory: what the tools need to reach it. */
+type Session = {
+  /** Bumped on every start, so a loop left from an earlier start never writes. */
+  generation: number
+  cwd: string
+  conn: { port: number; token: string } | undefined
+  bridge: BridgeState
+  stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult> | undefined
+}
+
+const session: Session = { generation: 0, cwd: '', conn: undefined, bridge: { status: 'starting' }, stream: undefined }
+
+const debug = ($: $, text: string) => {
+  try {
+    $.ui.log(`agent-relay: ${text}`, { to: 'debug' })
+  } catch {
+    // logging is best effort
+  }
+}
+
+const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+async function setBridge($: $, bridge: BridgeState) {
+  session.bridge = bridge
+  await update($, bridgeAtom, () => bridge)
+}
+
+// ---------------------------------------------------------------- events
+
+/** Cuts `text` to `max` characters, the last one an ellipsis, never splitting a surrogate pair. */
+function cut(text: string, max: number): string {
+  if (text.length <= max) return text
+  let end = max - 1
+  const last = text.charCodeAt(end - 1)
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1
+
+  return `${text.slice(0, end)}…`
+}
+
+function agentOf(taskId: string, task: TaskSummary | undefined): string {
+  const agent = task?.agent ?? SHORT_IDS[taskId.split('-')[0] ?? '']
+
+  return agent === undefined ? 'agent' : (LABELS[agent] ?? agent)
+}
+
+/** The prompt that wakes Claude for an agent that needs it. */
+function wakeText(taskId: string, reason: AttentionReason, text: string, task: TaskSummary | undefined): string {
+  const model = task?.model !== undefined && task.model !== '' ? task.model : 'default model'
+  const line = `[relay] ${taskId} (${agentOf(taskId, task)}, ${model}) ${reason}: ${text}`
+  // A permission's text already carries the bridge's own truncation notice: keep it whole.
+  if (reason === 'permission') return line
+  const short = cut(line, WAKE_CAP)
+
+  return reason === 'turn_ended' ? short + REVIEW_HINT : short
+}
+
+async function onEvent($: $, msg: Record<string, unknown>) {
+  switch (msg.type) {
+    case 'ready': {
+      const { port, token } = msg
+      if (typeof port !== 'number' || !Number.isInteger(port) || port <= 0 || typeof token !== 'string' || token === '') {
+        debug($, `bridge ready line without a usable port and token: ${JSON.stringify(msg).slice(0, 200)}`)
+        return
+      }
+      session.conn = { port, token }
+      await setBridge($, { status: 'up' })
+      return
+    }
+    case 'task': {
+      const task = msg.task
+      if (!isObject(task) || typeof task.id !== 'string') return debug($, 'task event without a task')
+      const summary = task as TaskSummary
+      await update($, tasksAtom, tasks =>
+        tasks.some(t => t.id === summary.id) ? tasks.map(t => (t.id === summary.id ? summary : t)) : [...tasks, summary],
+      )
+      return
+    }
+    case 'activity': {
+      const { taskId, entry } = msg
+      if (typeof taskId !== 'string' || !isObject(entry)) return debug($, 'activity event without a task id or entry')
+      await update($, activityAtom, all => ({
+        ...all,
+        [taskId]: [...(all[taskId] ?? []), entry as ActivityEntry].slice(-ACTIVITY_CAP),
+      }))
+      return
+    }
+    case 'attention': {
+      const { taskId, reason, text } = msg
+      if (typeof taskId !== 'string' || typeof reason !== 'string' || typeof text !== 'string') {
+        return debug($, 'attention event without a task id, reason or text')
+      }
+      const task = (await read($, tasksAtom)).find(t => t.id === taskId)
+      const prompt = wakeText(taskId, reason as AttentionReason, text, task)
+      // Queued: it starts a turn of its own once the session is idle. Not awaited, so the
+      // loop goes on reading the bridge meanwhile.
+      void $.prompt.submit({ text: prompt }).catch((err: unknown) => debug($, `wake for ${taskId} failed: ${errorText(err)}`))
+      return
+    }
+    default:
+      debug($, `unknown bridge event: ${JSON.stringify(msg).slice(0, 200)}`)
+  }
+}
+
+async function onLine($: $, line: string) {
+  if (line.trim() === '') return
+  let msg: unknown
+  try {
+    msg = JSON.parse(line)
+  } catch {
+    return debug($, `bridge stdout (not JSON): ${line}`)
+  }
+  if (!isObject(msg)) return debug($, `bridge stdout (not an object): ${line}`)
+  try {
+    await onEvent($, msg)
+  } catch (err) {
+    debug($, `could not fold a ${String(msg.type)} event: ${errorText(err)}`)
+  }
+}
+
+function describeExit(end: ProcessSpawnResult | undefined): string {
+  if (end === undefined) return 'the bridge stopped'
+  if (end.signal !== null) return `the bridge was killed by ${end.signal}`
+
+  return `the bridge exited with code ${String(end.code)}`
+}
+
+/** Runs the bridge for the session: the loop's life is the child's. */
+async function runBridge($: $, bridgePath: string, generation: number) {
+  const buffers = { stdout: '', stderr: '' }
+  let end: ProcessSpawnResult | undefined
+  let failure: string | undefined
+
+  try {
+    const stream = $.process.spawn({ argv: ['node', bridgePath] })
+    session.stream = stream
+    while (true) {
+      const step = await stream.next()
+      if (step.done === true) {
+        end = step.value
+        break
+      }
+      if (generation !== session.generation) continue
+      const { stream: pipe, text } = step.value
+      buffers[pipe] += text
+      let nl = buffers[pipe].indexOf('\n')
+      while (nl >= 0) {
+        const line = buffers[pipe].slice(0, nl).replace(/\r$/, '')
+        buffers[pipe] = buffers[pipe].slice(nl + 1)
+        if (pipe === 'stdout') await onLine($, line)
+        else if (line.trim() !== '') debug($, `bridge: ${line}`)
+        nl = buffers[pipe].indexOf('\n')
+      }
+    }
+  } catch (err) {
+    failure = errorText(err)
+  }
+
+  if (generation !== session.generation) return
+  if (buffers.stdout.trim() !== '') await onLine($, buffers.stdout.replace(/\r$/, ''))
+  if (buffers.stderr.trim() !== '') debug($, `bridge: ${buffers.stderr}`)
+  session.conn = undefined
+  session.stream = undefined
+  const error = failure !== undefined ? `could not run the bridge: ${failure}` : describeExit(end)
+  debug($, error)
+  try {
+    await setBridge($, { status: 'down', error })
+  } catch (err) {
+    debug($, `could not record the bridge as down: ${errorText(err)}`)
+  }
+  try {
+    $.ui.toast(STOPPED_TOAST)
+  } catch (err) {
+    debug($, `could not show the stopped toast: ${errorText(err)}`)
+  }
+}
+
+// ---------------------------------------------------------------- tools
+
+type Args = Record<string, unknown>
+type Route = { method: 'GET' | 'POST'; path: string; body?: Args }
+
+class ArgError extends Error {}
+
+function text(args: Args, name: string): string {
+  const v = args[name]
+  if (typeof v !== 'string' || v.trim() === '') throw new ArgError(`${name} must be a non-empty string`)
+
+  return v
+}
+
+function optionalText(args: Args, name: string): string | undefined {
+  const v = args[name]
+  if (v === undefined || v === null) return undefined
+  if (typeof v !== 'string') throw new ArgError(`${name} must be a string`)
+
+  return v === '' ? undefined : v
+}
+
+function optionalBool(args: Args, name: string): boolean | undefined {
+  const v = args[name]
+  if (v === undefined || v === null) return undefined
+  if (typeof v !== 'boolean') throw new ArgError(`${name} must be a boolean`)
+
+  return v
+}
+
+function agent(args: Args): AgentId {
+  const v = args.agent
+  if (typeof v !== 'string' || !(AGENTS as readonly string[]).includes(v)) {
+    throw new ArgError(`agent must be one of ${AGENTS.join(', ')}`)
+  }
+
+  return v as AgentId
+}
+
+/** The body, without the fields left out. */
+function body(fields: Record<string, unknown>): Args {
+  return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined))
+}
+
+const task = (args: Args) => `/tasks/${encodeURIComponent(text(args, 'taskId'))}`
+
+const TASK_ID = { type: 'string', description: 'The task id, as relay_delegate or relay_status gave it (e.g. cc-1, oc-2).' }
+const FROM_USER = {
+  type: 'boolean',
+  description: 'True when this relays the user\'s own answer (after relay_escalate and AskUserQuestion).',
+}
+const AGENT = { type: 'string', enum: [...AGENTS], description: 'opencode (OpenCode) or commandcode (Command Code).' }
+
+type ToolDef = {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+  route: (args: Args) => Route
+  /** Extra lines after the bridge's JSON. */
+  notes?: (args: Args, reply: unknown) => string[]
+}
+
+const schema = (properties: Record<string, unknown>, required: string[] = []) => ({
+  type: 'object',
+  properties,
+  required,
+  additionalProperties: false,
+})
+
+const TOOLS: readonly ToolDef[] = [
+  {
+    name: 'relay_delegate',
+    description:
+      'Delegate a self-contained build task to an external coding agent (OpenCode or Command Code). The agent works in its own git worktree and branch of repoPath, made from the last commit. The brief must stand alone: goal, files, constraints, done-criteria. Returns the task summary (its id, e.g. cc-1). You are woken with a [relay] prompt when the agent asks, needs a permission, ends its turn or fails.',
+    inputSchema: schema(
+      {
+        agent: AGENT,
+        title: { type: 'string', description: 'A short title for the task card.' },
+        brief: { type: 'string', description: 'The full, self-contained task for the agent.' },
+        repoPath: { type: 'string', description: 'Absolute path of the git repository to work in.' },
+        model: { type: 'string', description: 'Model id for the agent (see relay_models); its default when left out.' },
+        effort: { type: 'string', description: 'Reasoning effort, where the agent supports it.' },
+      },
+      ['agent', 'title', 'brief', 'repoPath'],
+    ),
+    route: args => ({
+      method: 'POST',
+      path: '/tasks',
+      body: body({
+        agent: agent(args),
+        title: text(args, 'title'),
+        brief: text(args, 'brief'),
+        repoPath: text(args, 'repoPath'),
+        model: optionalText(args, 'model'),
+        effort: optionalText(args, 'effort'),
+      }),
+    }),
+    notes: (args, reply) =>
+      isObject(reply) && reply.mainDirty === true
+        ? [
+            `Note: the main tree at ${String(args.repoPath)} has uncommitted changes. The agent works from the last commit and will not see them; commit them first if the agent needs them.`,
+          ]
+        : [],
+  },
+  {
+    name: 'relay_reply',
+    description:
+      "Send a message to a delegated task's agent: an answer to its question, or more work after its turn ended. Set fromUser when relaying the user's own words.",
+    inputSchema: schema({ taskId: TASK_ID, text: { type: 'string', description: 'The message.' }, fromUser: FROM_USER }, [
+      'taskId',
+      'text',
+    ]),
+    route: args => ({
+      method: 'POST',
+      path: `${task(args)}/reply`,
+      body: body({ text: text(args, 'text'), fromUser: optionalBool(args, 'fromUser') }),
+    }),
+  },
+  {
+    name: 'relay_answer',
+    description:
+      "Answer an agent's pending permission request (or a question with options) by choosing one of its options. Read the full request with relay_status {taskId} first when its preview says it was truncated.",
+    inputSchema: schema(
+      {
+        taskId: TASK_ID,
+        requestId: { type: 'string', description: "The pending request's requestId." },
+        optionId: { type: 'string', description: 'The chosen optionId from the pending request.' },
+        note: { type: 'string', description: 'Optional note recorded on the task thread.' },
+        fromUser: FROM_USER,
+      },
+      ['taskId', 'requestId', 'optionId'],
+    ),
+    route: args => ({
+      method: 'POST',
+      path: `${task(args)}/answer`,
+      body: body({
+        requestId: text(args, 'requestId'),
+        optionId: text(args, 'optionId'),
+        note: optionalText(args, 'note'),
+        fromUser: optionalBool(args, 'fromUser'),
+      }),
+    }),
+  },
+  {
+    name: 'relay_escalate',
+    description:
+      "Mark that an agent's question or request is being put to the user (the card shows \"waiting on you\"). Call it before AskUserQuestion, then relay the answer with relay_reply or relay_answer and fromUser: true.",
+    inputSchema: schema({ taskId: TASK_ID, question: { type: 'string', description: 'What the user is being asked.' } }, [
+      'taskId',
+      'question',
+    ]),
+    route: args => ({ method: 'POST', path: `${task(args)}/escalate`, body: { question: text(args, 'question') } }),
+  },
+  {
+    name: 'relay_status',
+    description:
+      'Without taskId: the summaries of all delegated tasks. With taskId: that task in detail (brief, thread, and any pending request with its full input); full: true adds the activity log.',
+    inputSchema: schema({ taskId: TASK_ID, full: { type: 'boolean', description: 'Include the activity log.' } }),
+    route: args => {
+      if (args.taskId === undefined || args.taskId === null || args.taskId === '') return { method: 'GET', path: '/tasks' }
+
+      return { method: 'GET', path: optionalBool(args, 'full') === true ? `${task(args)}?full=1` : task(args) }
+    },
+  },
+  {
+    name: 'relay_diff',
+    description: "The changes a task's agent made on its branch, against the commit it started from.",
+    inputSchema: schema({ taskId: TASK_ID }, ['taskId']),
+    route: args => ({ method: 'GET', path: `${task(args)}/diff` }),
+  },
+  {
+    name: 'relay_merge',
+    description: "Merge a finished task's branch into the main tree. Tell the user what landed and how to undo it.",
+    inputSchema: schema({ taskId: TASK_ID }, ['taskId']),
+    route: args => ({ method: 'POST', path: `${task(args)}/merge`, body: {} }),
+  },
+  {
+    name: 'relay_cancel',
+    description: "Stop a task's agent. Its branch and worktree are kept.",
+    inputSchema: schema({ taskId: TASK_ID }, ['taskId']),
+    route: args => ({ method: 'POST', path: `${task(args)}/cancel`, body: {} }),
+  },
+  {
+    name: 'relay_models',
+    description: 'The models an agent offers (and its default), for relay_delegate\'s model.',
+    inputSchema: schema({ agent: AGENT }, ['agent']),
+    route: args => ({
+      method: 'GET',
+      path: `/agents/${agent(args)}/models?repo=${encodeURIComponent(session.cwd)}`,
+    }),
+  },
+  {
+    name: 'relay_credits',
+    description:
+      'What the agents have spent this session (USD) and when Command Code last ran out of credits, if it did. Check before delegating to Command Code.',
+    inputSchema: schema({}),
+    route: () => ({ method: 'GET', path: '/spend' }),
+  },
+]
+
+const TOOL_DEFS = new Map(TOOLS.map(t => [t.name, t]))
+
+type Answer = { result: string } | { deny: string }
+
+/** Calls the bridge for one relay tool and answers the call. */
+async function serve($: $, name: string, args: Args): Promise<Answer> {
+  const def = TOOL_DEFS.get(name)
+  if (def === undefined) return { deny: `Agent relay: no tool ${name}` }
+  const conn = session.conn
+  if (conn === undefined) {
+    const { status, error } = session.bridge
+    const why = status === 'up' ? 'no connection' : error !== undefined ? `${status}: ${error}` : status
+
+    return { deny: `Agent relay bridge is not running (${why})` }
+  }
+
+  let route: Route
+  try {
+    route = def.route(args)
+  } catch (err) {
+    if (err instanceof ArgError) return { deny: `Agent relay: ${name}: ${err.message}` }
+    throw err
+  }
+
+  const headers: Record<string, string> = { Authorization: `Bearer ${conn.token}`, Accept: 'application/json' }
+  if (route.body !== undefined) headers['Content-Type'] = 'application/json'
+  let res
+  try {
+    res = await $.http.fetch(`http://127.0.0.1:${conn.port}${route.path}`, {
+      method: route.method,
+      headers,
+      ...(route.body !== undefined ? { body: JSON.stringify(route.body) } : {}),
+    })
+  } catch (err) {
+    return { deny: `Agent relay: could not reach the bridge: ${errorText(err)}` }
+  }
+
+  let reply: unknown
+  try {
+    reply = JSON.parse(res.text)
+  } catch {
+    reply = undefined
+  }
+  if (!res.ok) {
+    if (isObject(reply) && typeof reply.error === 'string') {
+      const code = typeof reply.code === 'string' ? `${reply.code}, ` : ''
+
+      return { deny: `Agent relay: ${reply.error} (${code}HTTP ${res.status})` }
+    }
+
+    return { deny: `Agent relay: HTTP ${res.status}: ${res.text.slice(0, 500)}` }
+  }
+
+  const notes = def.notes?.(args, reply) ?? []
+
+  return { result: [res.text, ...notes].join('\n') }
+}
+
+const failed = (name: string) => ({ deny: `Agent relay: ${name} failed inside the mod.` })
+
+export const register: Register = (on, options) => {
+  const bridgePath =
+    typeof options.bridgePath === 'string' && options.bridgePath.trim() !== '' ? options.bridgePath : DEFAULT_BRIDGE_PATH
+
+  on('session.start', async ($, e, next) => {
+    session.cwd = e.cwd
+    const registered = await Promise.allSettled(
+      TOOLS.map(t => $.tool.register({ name: t.name, description: t.description, inputSchema: t.inputSchema, isDeferred: false })),
+    )
+    registered.forEach((r, i) => {
+      if (r.status === 'rejected') debug($, `could not register ${TOOLS[i]?.name}: ${errorText(r.reason)}`)
+    })
+
+    // A fresh bridge for this start: the one an earlier start ran (if any) is let go, and the
+    // tasks it held went with it.
+    const generation = ++session.generation
+    const previous = session.stream
+    session.stream = undefined
+    session.conn = undefined
+    if (previous !== undefined) void previous.return({ code: null, signal: null }).catch(() => undefined)
+    await setBridge($, { status: 'starting' })
+    await update($, tasksAtom, () => [])
+    await update($, activityAtom, () => ({}))
+    await update($, expandedAtom, () => null)
+
+    void runBridge($, bridgePath, generation)
+
+    return next(e)
+  })
+
+  // One hook per tool, each matcher a literal so `claude plugin validate` reads them.
+  on('tool.call', { tool: 'mcp__agent-relay__relay_delegate' }, ($, e) => serve($, 'relay_delegate', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_delegate'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_reply' }, ($, e) => serve($, 'relay_reply', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_reply'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_answer' }, ($, e) => serve($, 'relay_answer', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_answer'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_escalate' }, ($, e) => serve($, 'relay_escalate', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_escalate'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_status' }, ($, e) => serve($, 'relay_status', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_status'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_diff' }, ($, e) => serve($, 'relay_diff', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_diff'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_merge' }, ($, e) => serve($, 'relay_merge', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_merge'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_cancel' }, ($, e) => serve($, 'relay_cancel', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_cancel'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_models' }, ($, e) => serve($, 'relay_models', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_models'),
+  )
+  on('tool.call', { tool: 'mcp__agent-relay__relay_credits' }, ($, e) => serve($, 'relay_credits', e)).catch(($, e, next) =>
+    next.called ? next(e) : failed('relay_credits'),
+  )
+}

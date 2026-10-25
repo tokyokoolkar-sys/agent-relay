@@ -1,0 +1,17 @@
+{
+  "name": "agent-relay",
+  "version": "0.1.0",
+  "description": "Delegate build work from Claude to OpenCode and Command Code agents through a local bridge, and follow their tasks.",
+  "author": {
+    "name": "Kool"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "bridgePath": {
+      "type": "string",
+      "title": "Bridge entry point",
+      "description": "Absolute path of the agent relay bridge's main.ts, started with node for each session.",
+      "default": "E:/ataspace/aiPlayground/Communication/bridge/src/main.ts"
+    }
+  }
+}

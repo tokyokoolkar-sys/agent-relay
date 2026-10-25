@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs'
 import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { GIT_TIMEOUT_MS, RelayError, assertRepo, commitAll, createWorktree, diff, isDirty, merge, resolveGit } from '../src/worktree.ts'
+import { GIT_TIMEOUT_MS, RelayError, assertRepo, branchExists, commitAll, createWorktree, diff, isDirty, merge, resolveGit } from '../src/worktree.ts'
 import { cleanupRepos, git, makePlainDir, makeRepo } from './helpers.ts'
 
 const failMergeAbort = vi.hoisted(() => ({ on: false }))
@@ -84,6 +84,17 @@ describe('createWorktree', () => {
     await createWorktree(repo, 'oc-2')
     const exclude = await readFile(join(repo, '.git', 'info', 'exclude'), 'utf8')
     expect(exclude.split('\n').filter((l) => l.trim() === '.relay/')).toHaveLength(1)
+  })
+})
+
+describe('branchExists', () => {
+  it('is true only for an existing local branch', async () => {
+    const repo = await makeRepo()
+    expect(await branchExists(repo, 'relay/oc-1')).toBe(false)
+    await createWorktree(repo, 'oc-1')
+    expect(await branchExists(repo, 'relay/oc-1')).toBe(true)
+    expect(await branchExists(repo, 'relay/oc-10')).toBe(false)
+    expect(await branchExists(repo, 'relay')).toBe(false)
   })
 })
 

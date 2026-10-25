@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -226,6 +226,27 @@ describe('delegation', () => {
     expect(log.slice(0, 2).map((l) => l.split(' ')[0]).sort()).toEqual([m1.body.commit, m2.body.commit].sort())
   })
 
+  it('skips ids whose branch or worktree survived an earlier bridge process', async () => {
+    const repo = await makeRepo()
+    const first = await boot()
+    await delegate(first, repo)
+    await delegate(first, repo)
+    await Promise.all([waitStatus(first, 'oc-1', 'idle'), waitStatus(first, 'oc-2', 'idle')])
+    await closers.pop()!() // the first bridge exits; relay/oc-1, relay/oc-2 and their worktrees remain
+    expect(await git(repo, 'branch', '--list', 'relay/oc-*')).toContain('relay/oc-2')
+
+    const second = await boot()
+    const t = await delegate(second, repo)
+    expect(t.id).toBe('oc-3')
+    await waitStatus(second, 'oc-3', 'idle')
+
+    // a leftover directory without a branch is skipped as well
+    mkdirSync(join(repo, '.relay', 'wt', 'oc-4'), { recursive: true })
+    const third = await boot()
+    const [a, b] = await Promise.all([delegate(third, repo), delegate(third, repo)])
+    expect([a.id, b.id].sort()).toEqual(['oc-5', 'oc-6'])
+  })
+
   it('refuses to merge a task that is still working', async () => {
     const e = await boot([{ hang: true }])
     const repo = await makeRepo()
@@ -341,12 +362,12 @@ describe('spend and models', () => {
 })
 
 describe('main.ts', () => {
-  async function startMain() {
+  async function startMain(extraEnv: Record<string, string> = {}) {
     const logDir = mkdtempSync(join(tmpdir(), 'relay-mainlog-'))
     logDirs.push(logDir)
     const logFile = join(logDir, 'fake.log')
     const child = spawn(process.execPath, [MAIN], {
-      env: { ...process.env, RELAY_FAKE_AGENT: FAKE, FAKE_LOG: logFile, FAKE_SCRIPT: JSON.stringify([{ hang: true }]) },
+      env: { ...process.env, RELAY_FAKE_AGENT: FAKE, FAKE_LOG: logFile, FAKE_SCRIPT: JSON.stringify([{ hang: true }]), ...extraEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -362,7 +383,7 @@ describe('main.ts', () => {
     const exited = new Promise<number | null>((r) => child.once('exit', (code) => r(code)))
     await waitFor(() => out.includes('\n'), `ready line (stderr: ${err})`, 30_000)
     const ready = JSON.parse(out.split('\n')[0]!)
-    return { child, ready, exited, lines: () => out.split('\n').filter(Boolean), logFile }
+    return { child, ready, exited, stderr: () => err, lines: () => out.split('\n').filter(Boolean), logFile }
   }
 
   async function runShutdown(how: (m: Awaited<ReturnType<typeof startMain>>) => void) {
@@ -394,6 +415,25 @@ describe('main.ts', () => {
     expect(lines.slice(1).some((ev) => ev.type === 'task' && ev.task.status === 'cancelled')).toBe(true)
     // the branch survives
     expect(await git(repo, 'branch', '--list', 'relay/oc-1')).toContain('relay/oc-1')
+  }
+
+  for (const mode of ['throw', 'reject']) {
+    it(`an uncaught ${mode} kills every agent and exits 1`, async () => {
+      const m = await startMain({ RELAY_TEST_CRASH: mode })
+      const repo = await makeRepo()
+      const res = await fetch(`http://127.0.0.1:${m.ready.port}/tasks`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${m.ready.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ agent: 'opencode', title: 't', brief: 'b', repoPath: repo }),
+      })
+      expect(res.status).toBe(200)
+      await waitFor(() => existsSync(m.logFile) && /started pid=\d+/.test(readFileSync(m.logFile, 'utf8')), 'fake agent start', 30_000)
+      const pid = Number(/started pid=(\d+)/.exec(readFileSync(m.logFile, 'utf8'))![1])
+      expect(await m.exited).toBe(1)
+      expect(alive(pid)).toBe(false)
+      expect(m.stderr()).toContain('killed 1 agent process tree(s)') // the handler killed it itself, not just the closing pipe
+      expect(m.stderr()).toContain(mode === 'throw' ? 'injected exception' : 'injected rejection')
+    }, 60_000)
   }
 
   it('prints the ready line, and exits 0 with the agent gone when stdin closes', async () => {

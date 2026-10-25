@@ -4,7 +4,7 @@ import type { AgentSpec } from './agents.ts'
 import { isOutOfCredits, classifyPermission, type PermissionParams } from './policy.ts'
 import { RpcPeer } from './rpc.ts'
 import type { ActivityEntry, BridgeEvent, DelegateRequest, PendingRequest, TaskDetail, TaskStatus, TaskSummary, ThreadEntry } from './types.ts'
-import { RelayError, commitAll, createWorktree, killTree } from './worktree.ts'
+import { RelayError, commitAll, createWorktree, killTree, killTreeSync } from './worktree.ts'
 
 type ConfigOption = { id: string; category?: string; currentValue?: string; options?: { value: string; name: string }[] }
 type Outcome = { outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } }
@@ -188,6 +188,11 @@ export class Task {
   /** Commit the worktree branched from, once the worktree exists. */
   get base(): string | undefined {
     return this.#wt?.base
+  }
+
+  /** Crash path only: kill the agent's process tree right now, without waiting for anything. */
+  killNow(): void {
+    if (this.#child) killTreeSync(this.#child)
   }
 
   summary(): TaskSummary {

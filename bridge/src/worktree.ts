@@ -1,4 +1,4 @@
-import { type ChildProcess, execFile } from 'node:child_process'
+import { type ChildProcess, execFile, execFileSync } from 'node:child_process'
 import { statSync } from 'node:fs'
 import { appendFile, lstat, mkdir, readFile, readdir, realpath, stat as statPath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -130,6 +130,25 @@ export function killTree(child: ChildProcess): void {
   })
 }
 
+/** Synchronous killTree for last-resort crash handlers: the process is about to exit, so nothing may be left async. Best effort. */
+export function killTreeSync(child: ChildProcess): void {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  try {
+    if (process.platform === 'win32' && child.pid !== undefined) {
+      const taskkill = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
+      execFileSync(taskkill, ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), windowsHide: true, stdio: 'ignore', timeout: 5000 })
+      return
+    }
+  } catch {
+    /* fall through to a plain kill */
+  }
+  try {
+    child.kill('SIGKILL')
+  } catch {
+    /* already gone */
+  }
+}
+
 /**
  * Runs git against `dir`. Inside a relay worktree the git dir is pinned explicitly (after verifying the `.git`
  * pointer), so nothing the agent wrote there can redirect git. Never rejects on a non-zero exit: callers
@@ -154,6 +173,11 @@ export async function assertRepo(repo: string): Promise<void> {
   }
   const head = await run(repo, ['rev-parse', '--verify', '--quiet', 'HEAD'])
   if (head.code !== 0) throw new RelayError('no_commits', `${repo} has no commits yet; make an initial commit first`)
+}
+
+/** True when `refs/heads/<branch>` exists in `repo`. */
+export async function branchExists(repo: string, branch: string): Promise<boolean> {
+  return (await run(repo, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])).code === 0
 }
 
 async function excludeRelayDir(repo: string): Promise<void> {

@@ -1,11 +1,12 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { statSync } from 'node:fs'
-import { isAbsolute } from 'node:path'
+import { stat } from 'node:fs/promises'
+import { isAbsolute, join } from 'node:path'
 import { AGENT_IDS, agentSpec } from './agents.ts'
 import { RpcPeer } from './rpc.ts'
 import { Task } from './task.ts'
 import type { AgentId, BridgeEvent, DelegateRequest, TaskSummary } from './types.ts'
-import { RelayError, assertRepo, diff, killTree, merge } from './worktree.ts'
+import { RelayError, assertRepo, branchExists, diff, killTree, killTreeSync, merge } from './worktree.ts'
 
 const PROBE_TIMEOUT_MS = 60_000
 const BUSY: readonly string[] = ['starting', 'running', 'asking', 'waiting_permission']
@@ -59,7 +60,8 @@ export class TaskRegistry {
     if (this.#closing) throw new RelayError('shutting_down', 'the bridge is shutting down')
 
     const spec = agentSpec(req.agent, this.#npmRoot)
-    const id = `${spec.short}-${++this.#seq}`
+    const id = await this.#allocateId(spec.short, req.repoPath)
+    if (this.#closing) throw new RelayError('shutting_down', 'the bridge is shutting down')
     let markReady: () => void = () => {}
     const worktreeReady = new Promise<void>((r) => (markReady = r))
     const task = new Task({
@@ -121,6 +123,19 @@ export class TaskRegistry {
     return result
   }
 
+  /**
+   * Next free id for this repo. The counter is bumped synchronously before each await, so concurrent delegations never
+   * see the same candidate; a candidate is skipped when an earlier bridge process left its branch or worktree behind.
+   */
+  async #allocateId(short: string, repo: string): Promise<string> {
+    for (;;) {
+      const id = `${short}-${++this.#seq}`
+      if (await branchExists(repo, `relay/${id}`)) continue
+      const dir = await stat(join(repo, '.relay', 'wt', id)).then(() => true, () => false)
+      if (!dir) return id
+    }
+  }
+
   /** The agent's `configOptions` (model, effort, ...), from a throwaway session in `repo`. Cached per agent. */
   models(agent: AgentId, repo: string): Promise<unknown[]> {
     if (!AGENT_IDS.includes(agent)) return Promise.reject(badRequest(`unknown agent ${agent}`))
@@ -158,6 +173,25 @@ export class TaskRegistry {
     this.#closing = true
     for (const child of this.#probes) killTree(child)
     await Promise.all([...this.#tasks.values()].map(({ task }) => task.cancel().catch((err) => console.error(`[task ${task.id}] cancel failed:`, err))))
+  }
+
+  /** Crash path only: synchronously kill every agent and probe process tree. Best effort, never throws. */
+  killAllNow(): number {
+    this.#closing = true
+    let n = 0
+    for (const child of this.#probes) {
+      killTreeSync(child)
+      n++
+    }
+    for (const { task } of this.#tasks.values()) {
+      try {
+        task.killNow()
+        n++
+      } catch {
+        /* keep killing the others */
+      }
+    }
+    return n
   }
 
   #entry(id: string) {

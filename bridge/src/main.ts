@@ -9,9 +9,37 @@ console.log = console.info = console.debug = console.error
 
 const SHUTDOWN_GRACE_MS = 15_000
 
+// Test-only crash injection: RELAY_TEST_CRASH=throw|reject makes the bridge crash once a task's turn is running.
+const crashMode = process.env.RELAY_TEST_CRASH
+let registryRef: TaskRegistry | undefined
+
+// Last resort: never leave agents running behind a dead bridge.
+function crash(kind: string, err: unknown): never {
+  try {
+    console.error(`[bridge] ${kind}:`, err)
+    const n = registryRef?.killAllNow() ?? 0
+    console.error(`[bridge] killed ${n} agent process tree(s) before exiting`)
+  } finally {
+    process.exit(1)
+  }
+}
+process.on('uncaughtException', (err) => crash('uncaught exception', err))
+process.on('unhandledRejection', (err) => crash('unhandled rejection', err))
+
 async function main(): Promise<void> {
   const npmRoot = await resolveNpmRoot()
-  const registry = new TaskRegistry(npmRoot, (e: BridgeEvent) => write(e))
+  let crashed = false
+  const registry = new TaskRegistry(npmRoot, (e: BridgeEvent) => {
+    write(e)
+    if (crashMode && !crashed && e.type === 'task' && e.task.status === 'running') {
+      crashed = true
+      setImmediate(() => {
+        if (crashMode === 'reject') void Promise.reject(new Error('injected rejection'))
+        else throw new Error('injected exception')
+      })
+    }
+  })
+  registryRef = registry
   const server = await startServer(registry)
 
   let shuttingDown = false

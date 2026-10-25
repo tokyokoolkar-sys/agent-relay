@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process'
 import { statSync } from 'node:fs'
 import { appendFile, lstat, mkdir, readFile, readdir, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 export class RelayError extends Error {
   code: string
@@ -145,37 +145,67 @@ export async function isDirty(dir: string): Promise<boolean> {
   return (await must(dir, ['status', '--porcelain', '--ignore-submodules=all'])).trim() !== ''
 }
 
-/** Every `.git` file or directory strictly below `root` (an embedded repository), as forward-slash relative paths. */
-async function findNestedGit(root: string): Promise<string[]> {
-  const found: string[] = []
+/** Gitlink (submodule) paths already recorded in the commit checked out in `dir`, as forward-slash paths. */
+async function headGitlinks(dir: string): Promise<Set<string>> {
+  const tree = await must(dir, ['ls-tree', '-r', '-z', 'HEAD'])
+  const links = tree.split('\0').filter((e) => e.startsWith('160000 '))
+  return new Set(links.map((e) => e.slice(e.indexOf('\t') + 1)))
+}
+
+const isInside = (root: string, p: string) => {
+  const r = process.platform === 'win32' ? root.toLowerCase() : root
+  const c = process.platform === 'win32' ? p.toLowerCase() : p
+  return c === r || c.startsWith(r.endsWith(sep) ? r : r + sep)
+}
+
+/**
+ * Pre-add scan of an agent-writable worktree. `nested`: `.git` entries (any case) strictly below the root that
+ * are not the `.git` of a gitlink HEAD already tracks. `outside`: symlinks or Windows junctions whose real
+ * target lies outside the worktree (git add would follow a junction and stage outside files). Forward-slash relative paths.
+ */
+async function scanWorktree(root: string, tracked: Set<string>): Promise<{ nested: string[]; outside: string[] }> {
+  const nested: string[] = []
+  const outside: string[] = []
+  const realRoot = await realpath(root)
+  const rel = (p: string) => relative(root, p).replaceAll('\\', '/')
   const walk = async (dir: string): Promise<void> => {
     for (const entry of await readdir(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name)
-      if (entry.name === '.git') {
-        if (dir !== root) found.push(relative(root, full).replaceAll('\\', '/'))
+      if (entry.name.toLowerCase() === '.git') {
+        if (dir !== root && !tracked.has(rel(dir))) nested.push(rel(full))
         continue
       }
-      if (entry.isDirectory()) await walk(full) // symlinks are not directories here, so they are never followed
+      if (entry.isSymbolicLink()) {
+        const real = await realpath(full).catch(() => undefined) // dangling links stage as plain link text
+        if (real && !isInside(realRoot, real)) outside.push(rel(full))
+      } else if (entry.isDirectory()) {
+        await walk(full)
+      }
     }
   }
   await walk(root)
-  return found
+  return { nested, outside }
 }
 
 /**
  * Stages and commits everything as Agent Relay. Returns false when there was nothing to commit.
- * Refuses (RelayError 'nested_repo') when the tree contains an embedded git repository: its own config could
- * run code (filter drivers) when git recurses into it, and it would be recorded as a gitlink anyway.
+ * Refuses, before anything is staged, a tree that contains an embedded git repository (RelayError 'nested_repo':
+ * its own config could run code, e.g. filter drivers, when git recurses into it) or a link pointing outside the
+ * worktree (RelayError 'link_outside_worktree'). Submodules already tracked in HEAD are left alone.
  */
 export async function commitAll(dir: string, message: string): Promise<boolean> {
-  const nested = await findNestedGit(resolve(dir))
+  const tracked = await headGitlinks(dir)
+  const { nested, outside } = await scanWorktree(resolve(dir), tracked)
   if (nested.length > 0) throw new RelayError('nested_repo', `embedded git repositories are not allowed: ${nested.join(', ')}`)
+  if (outside.length > 0) throw new RelayError('link_outside_worktree', `links pointing outside the worktree are not allowed: ${outside.join(', ')}`)
   await must(dir, ['add', '-A'])
-  const gitlinks = (await must(dir, ['ls-files', '-s', '-z'])).split('\0').filter((entry) => entry.startsWith('160000 '))
-  if (gitlinks.length > 0) {
-    const paths = gitlinks.map((entry) => entry.slice(entry.indexOf('\t') + 1))
-    throw new RelayError('nested_repo', `embedded git repositories are not allowed: ${paths.join(', ')}`)
-  }
+  // Backstop for anything the scan missed: a gitlink that HEAD does not already have.
+  const added = (await must(dir, ['ls-files', '-s', '-z']))
+    .split('\0')
+    .filter((e) => e.startsWith('160000 '))
+    .map((e) => e.slice(e.indexOf('\t') + 1))
+    .filter((p) => !tracked.has(p))
+  if (added.length > 0) throw new RelayError('nested_repo', `embedded git repositories are not allowed: ${added.join(', ')}`)
   if (!(await isDirty(dir))) return false
   await must(dir, [...IDENTITY, 'commit', '--no-verify', '-m', message])
   return true

@@ -313,4 +313,57 @@ describe('embedded repositories, git resolution, hooks, textconv', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it('refuses a case-variant .GIT entry', async () => {
+    const { mkdir } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    await mkdir(join(wt.path, 'sub'))
+    await writeFile(join(wt.path, 'sub', '.GIT'), 'gitdir: ../elsewhere\n')
+    await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'nested_repo' })
+  })
+
+  it('refuses a junction pointing outside the worktree and stages nothing from it', async () => {
+    const { mkdir, symlink } = await fs()
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const outside = await mkdtemp(join(tmpdir(), 'relay-outside-'))
+    const link = join(wt.path, 'j')
+    try {
+      await writeFile(join(outside, 'secret.txt'), 'top secret\n')
+      await symlink(outside, link, 'junction')
+      await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+      await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'link_outside_worktree', message: expect.stringContaining('j') })
+      expect(await git(wt.path, 'ls-files')).not.toContain('secret.txt')
+      expect(await git(wt.path, 'ls-tree', '-r', '--name-only', wt.branch)).not.toContain('secret.txt')
+      // a link that stays inside the worktree is fine to scan past (its target is a plain directory)
+      await rm(link, { recursive: true, force: true })
+      await mkdir(join(wt.path, 'real'))
+      await writeFile(join(wt.path, 'real', 'a.txt'), 'a\n')
+      expect(await commitAll(wt.path, 'ok')).toBe(true)
+    } finally {
+      await rm(link, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('allows a submodule already tracked in the base commit', async () => {
+    const { mkdir } = await fs()
+    const repo = await makeRepo()
+    const sha = await git(repo, 'rev-parse', 'HEAD')
+    await git(repo, 'update-index', '--add', '--cacheinfo', `160000,${sha},sub`)
+    await git(repo, 'commit', '-m', 'add submodule gitlink')
+    const wt = await createWorktree(repo, 'oc-1')
+    await mkdir(join(wt.path, 'sub'), { recursive: true })
+    // an initialised submodule checkout: a real repo at the tracked gitlink path
+    await git(join(wt.path, 'sub'), 'init', '-b', 'main')
+    await git(join(wt.path, 'sub'), '-c', 'user.name=S', '-c', 'user.email=s@localhost', 'commit', '--allow-empty', '-m', 'sub')
+    await writeFile(join(wt.path, 'new.txt'), 'hello\n')
+    expect(await commitAll(wt.path, 'add new file')).toBe(true)
+    expect(await git(wt.path, 'ls-tree', 'HEAD', 'sub')).toContain('160000 commit')
+    // a second, new nested repo is still refused
+    await mkdir(join(wt.path, 'other'))
+    await writeFile(join(wt.path, 'other', '.git'), 'gitdir: ../elsewhere\n')
+    await expect(commitAll(wt.path, 'nope')).rejects.toMatchObject({ code: 'nested_repo', message: expect.stringContaining('other/.git') })
+  })
 })

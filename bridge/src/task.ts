@@ -185,6 +185,11 @@ export class Task {
     await Promise.race([this.#closed, delay(5000)])
   }
 
+  /** Commit the worktree branched from, once the worktree exists. */
+  get base(): string | undefined {
+    return this.#wt?.base
+  }
+
   summary(): TaskSummary {
     const first = this.#pendings.values().next().value as PendingEntry | undefined
     return {

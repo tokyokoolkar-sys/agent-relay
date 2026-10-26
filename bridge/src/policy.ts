@@ -69,7 +69,7 @@ function suspiciousRaw(p: string): boolean {
 /**
  * Spellings below the worktree that can alias another file (hasAliasingComponent: `.git` under any NTFS spelling,
  * an 8.3 short name, on win32 a `:`). Checked on the part below the worktree only, so a worktree that itself lives
- * under a short name (`C:\Users\KOOL~1\...`) still works.
+ * under a short name (`C:\Users\USERNA~1\...`) still works.
  */
 const suspiciousBelow = hasAliasingComponent
 

@@ -8,7 +8,10 @@ import type { ActivityEntry, AgentId, AttentionReason, BridgeState, CardDetail, 
 // served over the bridge's HTTP API on 127.0.0.1, the Agents pane (one card per
 // task), `/relay` to open it, and the operating rules in the system prompt.
 
-const DEFAULT_BRIDGE_PATH = 'E:/ataspace/aiPlayground/Communication/bridge/src/main.ts'
+/** Where a clone of the repository keeps the bridge, from the mod's folder (<repo>/mod/agent-relay). */
+const BRIDGE_FROM_ROOT = ['..', '..', 'bridge', 'src', 'main.ts'] as const
+const NO_BRIDGE =
+  'no bridge found: set the agent-relay bridgePath option to the bridge/src/main.ts of your clone of the repository (see its README)'
 const ACTIVITY_CAP = 200
 const WAKE_CAP = 600
 const PERMISSION_CAP = 1200
@@ -936,9 +939,39 @@ function folderOf(path: string): string | undefined {
   return folder === '' || /^[A-Za-z]:$/.test(folder) ? `${folder}${path[cut]}` : folder
 }
 
+/**
+ * The bridge in a clone of the repository: the mod loaded from <repo>/mod/agent-relay finds
+ * <repo>/bridge/src/main.ts. Undefined where no such file is (an installed copy of the mod alone).
+ */
+async function findBridge($: $): Promise<string | undefined> {
+  const root = $.plugin.root.replace(/[\\/]+$/, '')
+  const sep = root.includes('\\') ? '\\' : '/'
+  const parts = root.split(/[\\/]/)
+  const ups = BRIDGE_FROM_ROOT.filter(p => p === '..').length
+  if (parts.length <= ups) return undefined
+  const candidate = [...parts.slice(0, -ups), ...BRIDGE_FROM_ROOT.slice(ups)].join(sep)
+  const found = await $.fs.stat(candidate).catch(() => undefined)
+
+  return found?.kind === 'file' ? candidate : undefined
+}
+
+/** Starts the configured bridge, or the one found beside the mod; with neither, the bridge is down with a setup hint. */
+async function startBridge($: $, how: { nodePath: string; bridgePath: string | undefined }, run: Run) {
+  const bridgePath = how.bridgePath ?? (await findBridge($))
+  if (!isCurrent(run)) return
+  if (bridgePath === undefined) {
+    session.run = undefined
+    await setBridge($, { status: 'down', error: NO_BRIDGE })
+    toast($, STOPPED_TOAST)
+
+    return
+  }
+  await runBridge($, { nodePath: how.nodePath, bridgePath }, run)
+}
+
 export const register: Register = (on, options) => {
   const bridgePath =
-    typeof options.bridgePath === 'string' && options.bridgePath.trim() !== '' ? options.bridgePath : DEFAULT_BRIDGE_PATH
+    typeof options.bridgePath === 'string' && options.bridgePath.trim() !== '' ? options.bridgePath : undefined
   const nodePath = typeof options.nodePath === 'string' && options.nodePath.trim() !== '' ? options.nodePath : DEFAULT_NODE
 
   on('session.start', async ($, e, next) => {
@@ -976,7 +1009,9 @@ export const register: Register = (on, options) => {
     // Not awaited: the pane may wait to be placed (a narrow terminal, no surface yet).
     void openPane($).catch((err: unknown) => debug($, `could not open the pane: ${errorText(err)}`))
 
-    if (isCurrent(run)) void runBridge($, { nodePath, bridgePath }, run)
+    if (isCurrent(run)) {
+      void startBridge($, { nodePath, bridgePath }, run).catch((err: unknown) => debug($, `could not start the bridge: ${errorText(err)}`))
+    }
 
     return next(e)
   })

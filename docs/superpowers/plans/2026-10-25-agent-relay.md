@@ -6,7 +6,7 @@
 
 **Architecture:** A Node bridge (`bridge/`) runs each delegated task in its own git worktree with its own ACP agent process, applies the permission policy, and exposes an HTTP API plus an NDJSON event stream on stdout. A Claude Code mod (`mod/agent-relay/`) spawns the bridge for the session, folds its events into `$.state`, draws the pane, registers the `relay_*` tools Claude calls, and wakes Claude with `$.prompt.submit` when an agent asks, finishes, fails, or runs out of credits.
 
-**Tech Stack:** Node 26 (runs `.ts` directly via type stripping; no build step), TypeScript 7 (`tsc --noEmit` only), vitest 5, `@agentclientprotocol/sdk@2.0.2` for **types only**, plus a minimal hand-written NDJSON JSON-RPC peer (as proven in the spike). Claude Code mod API build 2.1.308, checked with `C:\Users\Kool\.local\bin\claude.exe plugin validate|test`.
+**Tech Stack:** Node 26 (runs `.ts` directly via type stripping; no build step), TypeScript 7 (`tsc --noEmit` only), vitest 5, `@agentclientprotocol/sdk@2.0.2` for **types only**, plus a minimal hand-written NDJSON JSON-RPC peer (as proven in the spike). Claude Code mod API build 2.1.308, checked with `claude plugin validate|test`.
 
 **Spec:** `docs/superpowers/specs/2026-10-25-agent-relay-design.md` (read it, including "Spike findings" and "Command Code credits").
 
@@ -222,7 +222,7 @@ mod/agent-relay/
 
 **Interfaces:**
 - Consumes: bridge HTTP + events (T5), `TaskSummary`/`BridgeEvent` shapes (copy the types into `types/index.d.ts`; the mod cannot import from `bridge/`).
-- Manifest: `name: "agent-relay"`, `types: "./types/index.d.ts"`, `userConfig.bridgePath` (string, default `E:/ataspace/aiPlayground/Communication/bridge/src/main.ts`).
+- Manifest: `name: "agent-relay"`, `types: "./types/index.d.ts"`, `userConfig.bridgePath` (string, default `<repo>/bridge/src/main.ts`).
 - State contract: `PluginState['agent-relay'] = { tasks: TaskSummary[]; bridge: { status: 'starting' | 'up' | 'down'; error?: string }; expanded: string | null; activity: Record<string, ActivityEntry[]> }` (activity capped at last 200 per task).
 - `session.start`: spawn `['node', bridgePath]`, read lines in a detached loop: `ready` → keep `{port, token}` in module memory; `task` → upsert into `tasks`; `activity` → append; `attention` → `$.prompt.submit({ text })` with text `[relay] <taskId> (<agent label>, <model>) <reason>: <text>` (first 600 chars) — `turn_ended` text ends with "Review with relay_status / relay_diff."; loop end → `bridge.status='down'` + toast.
 - Tools (all `isDeferred: false`, each served by `on('tool.call', { tool: 'mcp__agent-relay__<name>' }, …)` returning `{ result }` with the bridge's JSON, or `{ deny: <error text> }` on HTTP error):

@@ -11,28 +11,56 @@ It has two parts: a Node bridge (`bridge/`) that runs the agents over ACP and se
 - git
 - OpenCode, Command Code, or both, installed and logged in
 
-## Load the mod in Claude Code
+## Install
 
-Point Claude Code at the mod folder:
+The mod and the bridge come from this repository. The mod installs from it like any plugin; the bridge runs from a clone of it.
+
+1. Clone the repository somewhere it can stay:
+
+   ```sh
+   git clone https://github.com/tokyokoolkar-sys/agent-relay.git
+   ```
+
+   The bridge needs no `npm install` to run: it has no runtime dependencies.
+
+2. Install the mod. At the prompt of a Claude Code terminal session:
+
+   ```
+   /plugin install agent-relay --marketplace tokyokoolkar-sys/agent-relay
+   ```
+
+   Answer `y` to add the marketplace, then pick a scope. From a shell instead:
+
+   ```sh
+   claude plugin install agent-relay --marketplace tokyokoolkar-sys/agent-relay
+   ```
+
+   In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `tokyokoolkar-sys/agent-relay`, then Add plugin. A mod installed from a terminal at the user scope also loads in the desktop app's sessions.
+
+3. When the install asks for the options, set `bridgePath` to the absolute path of `bridge/src/main.ts` in your clone, for example `C:/code/agent-relay/bridge/src/main.ts`.
+
+### Run it from the clone instead
+
+To work on the mod, point Claude Code at the mod folder of your clone:
 
 ```sh
-claude --plugin-dir <repo>/mod/agent-relay
+claude --plugin-dir <clone>/mod/agent-relay
 ```
 
 or set the environment variable before you start it:
 
 ```sh
-CLAUDE_CODE_PLUGIN_DIRS=<repo>/mod/agent-relay claude
+CLAUDE_CODE_PLUGIN_DIRS=<clone>/mod/agent-relay claude
 ```
 
-On each session start the mod runs `<nodePath> <bridgePath>` from the bridge's own folder, opens the Agents pane and adds the `/relay` command, which opens the pane again.
+Loaded this way, the mod finds the bridge beside it (`<clone>/bridge/src/main.ts`), so `bridgePath` can stay empty.
+
+On each session start the mod runs `<nodePath> <bridgePath>` from the bridge's own folder, opens the Agents pane and adds the `/relay` command, which opens the pane again. With no `bridgePath` and no bridge beside the mod, the pane says the bridge stopped and the relay tools answer with a setup hint.
 
 ### Options
 
-- `bridgePath` is the absolute path of the bridge's `main.ts`. The default is `E:/ataspace/aiPlayground/Communication/bridge/src/main.ts`. If you cloned the repo somewhere else, set `bridgePath` to `<repo>/bridge/src/main.ts` in the plugin's settings.
+- `bridgePath` is the absolute path of the bridge's `main.ts` in your clone. It is empty by default. Leave it empty only when the mod is loaded from the clone itself.
 - `nodePath` is the node that runs the bridge. The default, `node`, is looked up on PATH. You can set an absolute path instead, such as `C:/Program Files/nodejs/node.exe`, so that no other `node` on PATH is picked up.
-
-Run `npm install` in `bridge/` once before the first session.
 
 ## Managed setups
 

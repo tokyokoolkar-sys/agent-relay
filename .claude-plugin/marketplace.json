@@ -1,0 +1,12 @@
+{
+  "name": "agent-relay",
+  "owner": { "name": "tokyokoolkar-sys" },
+  "description": "Agent Relay: Claude Code orchestrates OpenCode and Command Code agents over ACP.",
+  "plugins": [
+    {
+      "name": "agent-relay",
+      "source": "./mod/agent-relay",
+      "description": "Delegate build work from Claude to OpenCode and Command Code agents through a local bridge, and follow their tasks."
+    }
+  ]
+}

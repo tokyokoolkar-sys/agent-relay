@@ -252,8 +252,8 @@ describe('classifyPermission', () => {
     expect(classifyPermission(write(`${WT}/sub/../a.txt`), WT, 'r').action).toBe('claude')
   })
 
-  it('auto-allows inside a worktree whose own path has an 8.3-style component (KOOL~1); still escalates one below it', () => {
-    const shortWt = join(base, 'KOOL~1', 'wt')
+  it('auto-allows inside a worktree whose own path has an 8.3-style component (USERNA~1); still escalates one below it', () => {
+    const shortWt = join(base, 'USERNA~1', 'wt')
     mkdirSync(join(shortWt, 'sub'), { recursive: true })
     expect(classifyPermission(write(join(shortWt, 'sub', 'a.txt')), shortWt, 'r').action).toBe('auto')
     expect(classifyPermission(write('sub/a.txt'), shortWt, 'r').action).toBe('auto')

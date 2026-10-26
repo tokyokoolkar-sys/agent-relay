@@ -59,7 +59,7 @@ subagents here · Command Code · OpenCode · sequential here.
   (`opencode/glm-5.3-flash-free`, `opencode/deepseek-v4.1-flash-free`, `opencode/big-pickle`, …).
 - Command Code v1.86.3 (`cmd` / `commandcode`) → `cmd acp` (ACP over stdio). 93 models
   (DeepSeek V4/V4.1, Kimi K3.x, GLM 5.x, Qwen 3.8, MiniMax…); has `--effort`, `--list-models`.
-- Both are npm `.ps1` shims under `C:\Users\Kool\AppData\Roaming\npm` — spawning must resolve the real
+- Both are npm `.ps1` shims under `%APPDATA%\npm` — spawning must resolve the real
   entry (e.g. via `cmd.exe /c` or the package's JS entry), not the `.ps1`.
 - Claude Code mod API (build 2.1.308): `$.ui.open` Pane, `$.tool.register` (tools Claude calls),
   `$.process.spawn` (streams child stdout; **stdin is one-shot only**), `$.http.fetch` (localhost OK),
@@ -76,7 +76,7 @@ Claude (main loop) ──tools──▶ mod "agent-relay" ──HTTP 127.0.0.1+t
    user ◀── AskUserQuestion    Pane: agent cards                             └─▶ cmd acp       (worktree B)
 ```
 
-### Repo layout — `E:\ataspace\aiPlayground\Communication` (git init; currently empty)
+### Repo layout — `the repository root` (git init; currently empty)
 
 - `bridge/` — TypeScript Node daemon, `@agentclientprotocol/sdk` client.
   - `agents.ts` — table: id, label, spawn argv, how model/effort are set.
@@ -151,8 +151,8 @@ Claude (main loop) ──tools──▶ mod "agent-relay" ──HTTP 127.0.0.1+t
 
 ## Spike findings (2026-10-25, step 0 done)
 
-- **Spawn entries (Windows):** OpenCode → `C:/Users/Kool/AppData/Roaming/npm/node_modules/@opencode/cli/bin/opencode.exe acp`;
-  Command Code → `node C:/Users/Kool/AppData/Roaming/npm/node_modules/command-code/dist/index.mjs acp`.
+- **Spawn entries (Windows):** OpenCode → `%APPDATA%/npm/node_modules/@opencode/cli/bin/opencode.exe acp`;
+  Command Code → `node %APPDATA%/npm/node_modules/command-code/dist/index.mjs acp`.
   Resolve via `npm root -g` at runtime, not hard-coded.
 - **Model / effort:** both expose ACP `configOptions` on `session/new`. Set with
   `session/set_config_option {sessionId, configId, type:"id", value}`. OpenCode: `model` (9 free models),

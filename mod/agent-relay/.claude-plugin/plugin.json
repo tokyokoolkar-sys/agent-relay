@@ -10,8 +10,8 @@
     "bridgePath": {
       "type": "string",
       "title": "Bridge entry point",
-      "description": "Absolute path of the agent relay bridge's main.ts, started with node for each session.",
-      "default": "E:/ataspace/aiPlayground/Communication/bridge/src/main.ts"
+      "description": "Absolute path of bridge/src/main.ts in your clone of the agent-relay repository, started with node for each session. Leave it empty when the mod is loaded from that clone: the bridge beside it is found.",
+      "default": ""
     },
     "nodePath": {
       "type": "string",

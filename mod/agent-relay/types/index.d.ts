@@ -15,6 +15,14 @@ export type TaskStatus =
   | 'cancelled'
   | 'out_of_credits'
 
+export type ThreadEntry = {
+  at: number
+  from: 'claude' | 'agent' | 'user' | 'bridge'
+  kind: 'brief' | 'message' | 'question' | 'answer' | 'permission' | 'decision' | 'escalation' | 'error'
+  text: string
+  requestId?: string
+}
+
 export type ActivityEntry = {
   at: number
   kind: 'thought' | 'message' | 'tool'
@@ -60,6 +68,9 @@ export type BridgeEvent =
 
 export type BridgeReady = { type: 'ready'; port: number; token: string }
 
+/** The expanded card's detail, from GET /tasks/:id: absent fields while it loads, `error` when it could not. */
+export type CardDetail = { id: string; brief?: string; thread?: ThreadEntry[]; error?: string }
+
 export type BridgeState = { status: 'starting' | 'up' | 'down'; error?: string }
 
 declare module 'claude-code' {
@@ -69,6 +80,7 @@ declare module 'claude-code' {
       bridge: BridgeState
       expanded: string | null
       activity: Record<string, ActivityEntry[]>
+      detail: CardDetail | null
     }
   }
 }

@@ -1,0 +1,4 @@
+{
+  "description": "Starts the agent relay bridge for the session, keeps its tasks in state, serves the relay tools and wakes Claude when an agent needs it.",
+  "modules": ["./register.tsx"]
+}

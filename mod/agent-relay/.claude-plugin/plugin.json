@@ -12,6 +12,12 @@
       "title": "Bridge entry point",
       "description": "Absolute path of the agent relay bridge's main.ts, started with node for each session.",
       "default": "E:/ataspace/aiPlayground/Communication/bridge/src/main.ts"
+    },
+    "nodePath": {
+      "type": "string",
+      "title": "Node executable",
+      "description": "The node that runs the bridge: node from PATH by default, or an absolute path such as C:/Program Files/nodejs/node.exe.",
+      "default": "node"
     }
   }
 }

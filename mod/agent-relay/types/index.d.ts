@@ -18,12 +18,14 @@ export type TaskStatus =
 export type ThreadEntry = {
   at: number
   from: 'claude' | 'agent' | 'user' | 'bridge'
-  kind: 'brief' | 'message' | 'question' | 'answer' | 'permission' | 'decision' | 'escalation' | 'error'
+  kind: 'brief' | 'message' | 'question' | 'answer' | 'permission' | 'decision' | 'escalation' | 'error' | 'note'
   text: string
   requestId?: string
 }
 
 export type ActivityEntry = {
+  /** Per task: a later event with the same id is the same entry, grown (streamed text) or updated (a tool's status). */
+  id: number
   at: number
   kind: 'thought' | 'message' | 'tool'
   text: string

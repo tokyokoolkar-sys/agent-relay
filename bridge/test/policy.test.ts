@@ -234,15 +234,16 @@ describe('classifyPermission', () => {
     if (d.action === 'question') expect(d.pending.options.map((o) => o.optionId)).toEqual(['option_0', 'option_1', 'option_2'])
   })
 
-  it('escalates an edit of an existing file that has another hard link; a read of it and plain files still auto-allow', () => {
+  it('escalates an edit or a read of an existing file that has another hard link; plain files still auto-allow', () => {
     const outside = join(base, 'outside-hl')
     mkdirSync(outside, { recursive: true })
     writeFileSync(join(outside, 'secret.txt'), 'top secret\n')
     linkSync(join(outside, 'secret.txt'), join(WT, 'hl.txt'))
     expect(classifyPermission(write(join(WT, 'hl.txt')), WT, 'r').action).toBe('claude')
-    expect(classifyPermission(write(join(WT, 'hl.txt'), { kind: 'read', rawInput: { file_path: join(WT, 'hl.txt') } }), WT, 'r').action).toBe('auto')
+    expect(classifyPermission(write(join(WT, 'hl.txt'), { kind: 'read', rawInput: { file_path: join(WT, 'hl.txt') } }), WT, 'r').action).toBe('claude')
     writeFileSync(join(WT, 'plain.txt'), 'x')
     expect(classifyPermission(write(join(WT, 'plain.txt')), WT, 'r').action).toBe('auto')
+    expect(classifyPermission(write(join(WT, 'plain.txt'), { kind: 'read', rawInput: { file_path: join(WT, 'plain.txt') } }), WT, 'r').action).toBe('auto')
   })
 
   it('refuses a raw path with a .. component, even one that stays inside', () => {

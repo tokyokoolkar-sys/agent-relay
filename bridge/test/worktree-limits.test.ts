@@ -33,6 +33,17 @@ describe('hardlinks', () => {
     expect(await git(wt.path, 'log', '--format=%s', `${wt.base}..${wt.branch}`)).toBe('')
   })
 
+  it('refuses a hardlink before staging anything: its content never reaches the object store', async () => {
+    const repo = await makeRepo()
+    const wt = await createWorktree(repo, 'oc-1')
+    const outside = await makePlainDir()
+    await writeFile(join(outside, 'secret.txt'), 'never hashed into the repo\n')
+    const sha = await git(outside, 'hash-object', 'secret.txt')
+    await link(join(outside, 'secret.txt'), join(wt.path, 'h.txt'))
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'hardlink' })
+    await expect(git(repo, 'cat-file', '-e', sha)).rejects.toThrow()
+  })
+
   it('refuses a tracked file swapped for a hardlink', async () => {
     const repo = await makeRepo()
     const wt = await createWorktree(repo, 'oc-1')
@@ -74,12 +85,53 @@ describe('staged symlinks', () => {
     await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'link_outside_worktree', message: expect.stringContaining('ext') })
   })
 
-  it('commits a symlink whose link text stays inside the worktree', async () => {
+  it('commits a symlink whose relative link text stays inside the worktree', async () => {
     const repo = await makeRepo()
     const wt = await createWorktree(repo, 'oc-1')
+    await mkdir(join(wt.path, 'sub'))
     if (!(await trySymlink('README.md', join(wt.path, 'readme-link')))) return
+    await trySymlink(join('..', 'README.md'), join(wt.path, 'sub', 'up-link'))
     expect(await commitAll(wt.path, 'link', wt.base)).toBe(true)
     expect(await git(wt.path, 'ls-tree', 'HEAD', 'readme-link')).toContain('120000')
+    expect(await git(wt.path, 'ls-tree', 'HEAD', 'sub/up-link')).toContain('120000')
+  })
+
+  /** A worktree whose base has a link `l` checked out as a plain file (core.symlinks=false): writing `l` sets link text. */
+  async function linkAsPlainFile() {
+    const repo = await makeRepo()
+    await writeFile(join(repo, 'linktext.tmp'), 'README.md')
+    const sha = await git(repo, 'hash-object', '-w', 'linktext.tmp')
+    await rm(join(repo, 'linktext.tmp'))
+    await git(repo, 'update-index', '--add', '--cacheinfo', `120000,${sha},l`)
+    await git(repo, 'commit', '-m', 'a link')
+    await git(repo, 'config', 'core.symlinks', 'false')
+    return createWorktree(repo, 'oc-1')
+  }
+
+  it.each([
+    ['an absolute path into the worktree itself', (wt: string) => join(wt, 'README.md')],
+    ['a drive path', () => 'C:/Windows/win.ini'],
+    ['a drive-relative path', () => 'C:win.ini'],
+    ['a POSIX absolute path', () => '/etc/passwd'],
+    ['a UNC path', () => '\\\\server\\share\\x'],
+    ['a device path', () => '\\\\?\\C:\\x'],
+    ['a relative path that climbs out', () => '../../../../x'],
+  ])('refuses link text that is %s', async (_what, text) => {
+    const wt = await linkAsPlainFile()
+    await writeFile(join(wt.path, 'l'), text(wt.path))
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'link_outside_worktree', message: expect.stringContaining('l') })
+  })
+
+  it.each([['.git'], ['sub/.GIT/config'], ['sub/GIT~1/config'], ['LONGFI~1.TXT'], ['a.txt:stream']])('refuses link text naming %s below the worktree', async (text) => {
+    const wt = await linkAsPlainFile()
+    await writeFile(join(wt.path, 'l'), text)
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'suspicious_link', message: expect.stringContaining('l') })
+  })
+
+  it('accepts link text that stays inside after climbing within the worktree', async () => {
+    const wt = await linkAsPlainFile()
+    await writeFile(join(wt.path, 'l'), 'sub/../README.md')
+    expect(await commitAll(wt.path, 'ok', wt.base)).toBe(true)
   })
 })
 

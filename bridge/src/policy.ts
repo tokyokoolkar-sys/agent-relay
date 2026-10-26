@@ -1,7 +1,7 @@
 import { lstatSync, realpathSync } from 'node:fs'
 import { relative, resolve, sep } from 'node:path'
 import type { PendingRequest } from './types.ts'
-import { isDotGit, isInside as isUnder } from './worktree.ts'
+import { hasAliasingComponent, isInside as isUnder } from './worktree.ts'
 
 export type PermissionParams = { sessionId: string; toolCall: { toolCallId: string; title?: string; kind?: string; rawInput?: any; locations?: { path: string }[] }; options: { optionId: string; name: string; kind: string }[] }
 export type Decision = { action: 'auto'; optionId: string; note: string } | { action: 'question'; pending: PendingRequest } | { action: 'claude'; pending: PendingRequest }
@@ -67,16 +67,16 @@ function suspiciousRaw(p: string): boolean {
 }
 
 /**
- * Spellings below the worktree that can alias another file: a `.git` component under any NTFS spelling, an 8.3
- * short name, on win32 a `:`. Checked on the part below the worktree only, so a worktree that itself lives under a short
- * name (`C:\Users\KOOL~1\...`) still works.
+ * Spellings below the worktree that can alias another file (hasAliasingComponent: `.git` under any NTFS spelling,
+ * an 8.3 short name, on win32 a `:`). Checked on the part below the worktree only, so a worktree that itself lives
+ * under a short name (`C:\Users\KOOL~1\...`) still works.
  */
-function suspiciousBelow(rel: string): boolean {
-  const parts = components(rel)
-  return parts.some(isDotGit) || parts.some((c) => /~\d/.test(c) || (process.platform === 'win32' && c.includes(':')))
-}
+const suspiciousBelow = hasAliasingComponent
 
-/** An existing regular file with more than one hard link: an edit through it writes a file that may live anywhere. Fails closed. */
+/**
+ * An existing regular file with more than one hard link: an edit through it writes, and a read of it reads, a file
+ * that may live anywhere on the volume. Fails closed.
+ */
 function hardlinked(abs: string): boolean {
   try {
     const st = lstatSync(abs)
@@ -128,7 +128,7 @@ function autoReason(tc: PermissionParams['toolCall'], worktree: string): string 
     const abs = resolve(worktree, p)
     if (!isInside(abs, worktree) || suspiciousBelow(relative(resolve(worktree), abs))) return undefined
     if (!realInside(abs, worktree)) return undefined
-    if (tc.kind === 'edit' && hardlinked(abs)) return undefined
+    if (hardlinked(abs)) return undefined
   }
   return `${tc.kind} inside worktree: ${paths.join(', ')}`
 }

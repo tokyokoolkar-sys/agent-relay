@@ -2,7 +2,7 @@ import { type ChildProcess, execFile, execFileSync } from 'node:child_process'
 import { statSync } from 'node:fs'
 import { appendFile, lstat, mkdir, readFile, readdir, realpath, rmdir, stat as statPath, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 
 export class RelayError extends Error {
   code: string
@@ -276,13 +276,31 @@ export const isDotGit = (name: string) => {
   return base === '.git' || /^git~\d+$/.test(base)
 }
 
-type Findings = { nested: string[]; dirLinks: string[]; outside: string[]; hardlinks?: string[] }
+/**
+ * A component of a worktree-relative path that can alias another file: `.git` under any NTFS spelling, an 8.3 short
+ * name (`GIT~1`, `LONGFI~1.TXT`), and on win32 a `:` (an alternate data stream or a device). The same rules decide
+ * the auto-allow policy (policy.ts) and which staged link targets are refused.
+ */
+export function hasAliasingComponent(rel: string): boolean {
+  return rel
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .some((c) => isDotGit(c) || /~\d/.test(c) || (process.platform === 'win32' && c.includes(':')))
+}
+
+/** Link text that names an absolute place: POSIX `/x`, UNC `\\server`, device `\\?\`, a drive `C:\x` or drive-relative `C:x`. */
+const absoluteLinkText = (text: string) => /^[\\/]/.test(text) || /^[a-z]:/i.test(text)
+
+type Findings = { nested: string[]; dirLinks: string[]; outside: string[]; hardlinks?: string[]; suspicious?: string[] }
 
 function refusal(f: Findings): RelayError | undefined {
   if (f.nested.length > 0) return new RelayError('nested_repo', `embedded git repositories are not allowed: ${f.nested.join(', ')}`)
   if (f.dirLinks.length > 0) return new RelayError('directory_link', `directory links (junctions, directory symlinks) are not allowed: ${f.dirLinks.join(', ')}`)
   if (f.outside.length > 0) return new RelayError('link_outside_worktree', `links pointing outside the worktree are not allowed: ${f.outside.join(', ')}`)
   if (f.hardlinks && f.hardlinks.length > 0) return new RelayError('hardlink', `files with more than one hard link are not allowed: ${f.hardlinks.join(', ')}`)
+  if (f.suspicious && f.suspicious.length > 0) {
+    return new RelayError('suspicious_link', `links whose target names .git, an 8.3 short name or a ':' are not allowed: ${f.suspicious.join(', ')}`)
+  }
   return undefined
 }
 
@@ -292,11 +310,11 @@ function refusal(f: Findings): RelayError | undefined {
  * rules and holding no index entry in any case variant. Forward-slash relative paths.
  * `nested`: any `.git` entry (any case) below the root, a submodule checkout included (worktrees never have
  * submodules initialised). `dirLinks`: every junction or directory symlink, wherever it points. `outside`: file
- * links whose real target lies outside the worktree.
+ * links whose real target lies outside the worktree. `hardlinks`: regular files with more than one hard link.
  */
 async function scanWorktree(dir: string, trackedDirs: Set<string>): Promise<Findings> {
   const root = resolve(dir)
-  const found: Findings = { nested: [], dirLinks: [], outside: [] }
+  const found: Findings = { nested: [], dirLinks: [], outside: [], hardlinks: [] }
   const realRoot = await realpath(root)
   const rel = (p: string) => relative(root, p).replaceAll('\\', '/')
   let level = [root]
@@ -315,6 +333,10 @@ async function scanWorktree(dir: string, trackedDirs: Set<string>): Promise<Find
           else if (target && !isInside(realRoot, await realpath(full))) found.outside.push(rel(full))
         } else if (entry.isDirectory()) {
           subdirs.push(full)
+        } else if (entry.isFile()) {
+          // refused before `git add` reads it: a hardlinked file's content never reaches the object store
+          const st = await lstat(full).catch(() => undefined)
+          if (st && st.nlink > 1) found.hardlinks!.push(rel(full))
         }
       }
     }
@@ -343,9 +365,9 @@ async function stagedEntries(dir: string): Promise<StagedEntry[]> {
  * only changed ones; one cached lstat per directory plus one lstat and one realpath per entry, run 32 at a time,
  * stays well under a second for a few thousand files). An entry is refused when a path component is `.git`, when
  * it is a gitlink that `base` does not have at that sha, when one of its ancestor directories is a link, when its
- * real path is outside the worktree, when it is a link (mode 120000) whose link text, read from the staged blob,
- * resolves outside the worktree (dangling or not, and whatever is on disk: with core.symlinks=false the link is a
- * plain file), or when it is a regular file with more than one hard link (its content is shared with a file that
+ * real path is outside the worktree, when it is a link (mode 120000) whose link text, read from the staged blob, is
+ * absolute or resolves (relative to the worktree) outside it or onto a `.git`, 8.3 or `:` component (dangling or
+ * not, and whatever is on disk: with core.symlinks=false the link is a plain file), or when it is a regular file with more than one hard link (its content is shared with a file that
  * may live anywhere on the volume). Links `base` already has, unchanged, are the user's own and are not judged.
  */
 async function verifyStaged(dir: string, entries: StagedEntry[], base: Map<string, { mode: string; sha: string }>): Promise<Findings> {
@@ -355,6 +377,7 @@ async function verifyStaged(dir: string, entries: StagedEntry[], base: Map<strin
   const dirLinks = new Set<string>()
   const outside = new Set<string>()
   const hardlinks = new Set<string>()
+  const suspicious = new Set<string>()
   const linkDirs = new Map<string, Promise<boolean>>()
   const missing = (err: NodeJS.ErrnoException) => {
     if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return undefined // not on disk (e.g. skip-worktree): nothing read
@@ -383,8 +406,11 @@ async function verifyStaged(dir: string, entries: StagedEntry[], base: Map<strin
     }
     const full = join(root, path)
     if (mode === '120000' && !unchanged) {
+      // judged as text, relative to the worktree: never against the absolute worktree path, never on disk
       const text = await must(dir, ['cat-file', 'blob', sha])
-      if (!isInside(root, resolve(dirname(full), text))) outside.add(path)
+      const target = posix.normalize(posix.join(posix.dirname(path), text.replaceAll('\\', '/')))
+      if (absoluteLinkText(text) || target === '..' || target.startsWith('../')) outside.add(path)
+      else if (hasAliasingComponent(target)) suspicious.add(path)
     }
     if (mode === '100644' || mode === '100755') {
       const st = await lstat(full).catch(missing)
@@ -398,7 +424,7 @@ async function verifyStaged(dir: string, entries: StagedEntry[], base: Map<strin
     while (next < entries.length) await check(entries[next++]!)
   }
   await Promise.all(Array.from({ length: Math.min(32, entries.length) }, worker))
-  return { nested: [...nested], dirLinks: [...dirLinks], outside: [...outside], hardlinks: [...hardlinks] }
+  return { nested: [...nested], dirLinks: [...dirLinks], outside: [...outside], hardlinks: [...hardlinks], suspicious: [...suspicious] }
 }
 
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
@@ -426,7 +452,12 @@ const AGENT_STATE_DIRS = ['.commandcode', '.opencode']
  *   path that goes through one.
  * - RelayError('link_outside_worktree'): a file link, or staged path, whose real target is outside the worktree,
  *   or a staged link whose link text resolves outside it.
- * - RelayError('hardlink'): a staged regular file with more than one hard link.
+ * - RelayError('hardlink'): a regular file with more than one hard link (refused by the scan, and again if staged).
+ * - RelayError('suspicious_link'): a staged link whose target names `.git`, an 8.3 short name or a `:`.
+ *
+ * Requires the agent to be idle (R15: called only between turns, while no agent request is in flight). The scan,
+ * `git add` and the post-stage check are separate steps; a file swapped between them by a live agent is what the
+ * post-stage check exists to catch, but only an idle agent makes the sequence airtight.
  */
 export async function commitAll(dir: string, message: string, base: string, onLeftOut?: (dirs: string[]) => void): Promise<boolean> {
   if (!SHA.test(base)) throw new RelayError('bad_base', `base must be a full commit sha, got ${JSON.stringify(base)}`)

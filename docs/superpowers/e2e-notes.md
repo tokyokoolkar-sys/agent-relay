@@ -14,12 +14,22 @@ Live Claude Code desktop session, mod loaded from the session's dev-mods folder,
 | Cost tracking | Pass: Command Code $0.0025 → $0.0050 over two turns (cumulative, ruling R20). OpenCode $0. |
 | Stop a running task | Pass: `relay_cancel` killed the agent and its `opencode serve` child; branch and worktree kept. |
 
+## After the final fix wave
+
+| Check | Result |
+| --- | --- |
+| Mod reload hard-kills the bridge while an agent is busy | Pass: old bridge and all three agent trees exited (agents exit on stdin EOF); new bridge started under `claude.exe`. |
+| Task numbering after a restart skips taken branches | Pass: new bridge's first task was `oc-2` (`relay/oc-1` exists). |
+| Untrusted framing on tool results | Pass: `relay_diff` result starts with the untrusted-content line. |
+| Merge marks the task done and stops its agent | Pass: status `done`, no OpenCode process left. |
+| `relay_cleanup` | Pass: worktree removed, branch `relay/oc-2` kept. |
+
 ## Found during the run
 
 - Command Code's learning system writes `.commandcode/taste/taste.md` into the worktree after each turn, and the bridge's turn-end commit picked it up. The agent rightly refused to delete it. Fix: the bridge should keep agent-owned state folders (`.commandcode/`, `.opencode/`) out of relay commits.
 
 ## Not covered
 
-- Graceful bridge shutdown when the session ends (needs the session to end).
+- Graceful bridge shutdown when the session ends (needs the session to end). The hard-kill path (mod reload) is verified above.
 - Pressing the pane's Stop button by hand (`relay_cancel` uses the same route).
 - An out-of-credits run (Command Code had credit).

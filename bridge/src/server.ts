@@ -78,7 +78,12 @@ function tokenMatches(given: string | undefined, token: string): boolean {
   return timingSafeEqual(a, b)
 }
 
-export async function startServer(reg: TaskRegistry): Promise<{ port: number; token: string; close(): Promise<void> }> {
+export type ServerOptions = {
+  /** Serves an authenticated `POST /shutdown`: the reply `{ ok: true }` is sent first, then this runs. Without it the route is 404. */
+  onShutdown?: () => void
+}
+
+export async function startServer(reg: TaskRegistry, opts: ServerOptions = {}): Promise<{ port: number; token: string; close(): Promise<void> }> {
   const token = randomBytes(32).toString('hex')
   let port = 0
 
@@ -100,6 +105,13 @@ export async function startServer(reg: TaskRegistry): Promise<{ port: number; to
     const method = req.method ?? 'GET'
     const body = method === 'POST' ? await readBody(req, res) : {}
     const route = (m: string, ...shape: string[]) => m === method && shape.length === parts.length && shape.every((s, i) => s.startsWith(':') || s === parts[i])
+
+    if (route('POST', 'shutdown') && opts.onShutdown) {
+      const onShutdown = opts.onShutdown
+      // the reply goes out before the graceful shutdown closes the server and its connections
+      res.once('finish', () => setImmediate(onShutdown))
+      return send(res, 200, { ok: true })
+    }
 
     if (route('GET', 'spend')) return send(res, 200, reg.spend())
 

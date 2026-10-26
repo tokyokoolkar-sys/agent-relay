@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { TaskRegistry } from '../src/registry.ts'
-import { startServer } from '../src/server.ts'
+import { startServer, type ServerOptions } from '../src/server.ts'
 import type { BridgeEvent, TaskDetail, TaskSummary } from '../src/types.ts'
 import { cleanupRepos, git, makePlainDir, makeRepo } from './helpers.ts'
 
@@ -18,7 +18,7 @@ type Res = { status: number; body: any }
 const closers: (() => Promise<void> | void)[] = []
 const logDirs: string[] = []
 
-async function boot(script: unknown[] = [{ writeFile: 'a.txt' }]): Promise<Env> {
+async function boot(script: unknown[] = [{ writeFile: 'a.txt' }], opts: ServerOptions = {}): Promise<Env> {
   const logDir = mkdtempSync(join(tmpdir(), 'relay-srvlog-'))
   logDirs.push(logDir)
   const logFile = join(logDir, 'fake.log')
@@ -27,7 +27,7 @@ async function boot(script: unknown[] = [{ writeFile: 'a.txt' }]): Promise<Env> 
   process.env.FAKE_SCRIPT = JSON.stringify(script)
   const events: BridgeEvent[] = []
   const reg = new TaskRegistry('unused', (e) => events.push(e))
-  const srv = await startServer(reg)
+  const srv = await startServer(reg, opts)
   closers.push(async () => {
     await srv.close()
     await reg.shutdown()
@@ -141,6 +141,24 @@ describe('HTTP hardening', () => {
     const r = await call(e, 'GET', '/tasks')
     expect(r.status).toBe(500)
     expect(JSON.stringify(r.body)).not.toMatch(/boom|secret|\bat \w/)
+  })
+})
+
+describe('POST /shutdown', () => {
+  it('answers { ok: true } and only then runs the shutdown, behind the token', async () => {
+    let calls = 0
+    const e = await boot(undefined, { onShutdown: () => void calls++ })
+    expect((await call(e, 'POST', '/shutdown', undefined, null)).status).toBe(401)
+    expect((await call(e, 'GET', '/shutdown')).status).toBe(404)
+    expect(calls).toBe(0)
+    const r = await call(e, 'POST', '/shutdown')
+    expect(r).toEqual({ status: 200, body: { ok: true } })
+    await waitFor(() => calls === 1, 'the shutdown handler')
+  })
+
+  it('is 404 when the server was started without a shutdown handler', async () => {
+    const e = await boot()
+    expect((await call(e, 'POST', '/shutdown')).status).toBe(404)
   })
 })
 
@@ -362,7 +380,7 @@ describe('spend and models', () => {
 })
 
 describe('main.ts', () => {
-  async function startMain(extraEnv: Record<string, string> = {}) {
+  async function startMain(extraEnv: Record<string, string> = {}, closeStdin = false) {
     const logDir = mkdtempSync(join(tmpdir(), 'relay-mainlog-'))
     logDirs.push(logDir)
     const logFile = join(logDir, 'fake.log')
@@ -374,6 +392,8 @@ describe('main.ts', () => {
     closers.push(() => {
       if (child.exitCode === null) child.kill('SIGKILL')
     })
+    // as the Claude Code mod's $.process.spawn starts it: stdin closed from the start
+    if (closeStdin) child.stdin.end()
     let out = ''
     let err = ''
     child.stdout.setEncoding('utf8')
@@ -386,8 +406,8 @@ describe('main.ts', () => {
     return { child, ready, exited, stderr: () => err, lines: () => out.split('\n').filter(Boolean), logFile }
   }
 
-  async function runShutdown(how: (m: Awaited<ReturnType<typeof startMain>>) => void) {
-    const m = await startMain()
+  async function runShutdown(how: (m: Awaited<ReturnType<typeof startMain>>) => unknown, env: Record<string, string> = {}, closeStdin = false) {
+    const m = await startMain(env, closeStdin)
     expect(m.ready.type).toBe('ready')
     expect(typeof m.ready.port).toBe('number')
     expect(m.ready.token).toMatch(/^[0-9a-f]{32,}$/)
@@ -403,7 +423,7 @@ describe('main.ts', () => {
     const pid = Number(/started pid=(\d+)/.exec(readFileSync(m.logFile, 'utf8'))![1])
     expect(alive(pid)).toBe(true)
 
-    how(m)
+    await how(m)
     expect(await m.exited).toBe(0)
     await waitFor(() => !alive(pid), 'agent process to be gone')
 
@@ -438,6 +458,72 @@ describe('main.ts', () => {
 
   it('prints the ready line, and exits 0 with the agent gone when stdin closes', async () => {
     await runShutdown((m) => m.child.stdin.end())
+  }, 60_000)
+
+  it('with RELAY_WATCH_PARENT=1 and stdin closed it stays up, then exits 0 with the agent gone on POST /shutdown', async () => {
+    await runShutdown(
+      async (m) => {
+        // stdin closed at spawn: well past the moment an unwatched bridge would have shut down
+        await new Promise((r) => setTimeout(r, 1500))
+        expect(m.child.exitCode).toBeNull()
+        const list = await fetch(`http://127.0.0.1:${m.ready.port}/tasks`, { headers: { authorization: `Bearer ${m.ready.token}` } })
+        expect(list.status).toBe(200)
+        expect((await list.json()).map((t: TaskSummary) => t.id)).toEqual(['oc-1'])
+        const res = await fetch(`http://127.0.0.1:${m.ready.port}/shutdown`, { method: 'POST', headers: { authorization: `Bearer ${m.ready.token}` } })
+        expect(res.status).toBe(200)
+        expect(await res.json()).toEqual({ ok: true })
+      },
+      { RELAY_WATCH_PARENT: '1' },
+      true,
+    )
+  }, 60_000)
+
+  it('with RELAY_WATCH_PARENT=1 it shuts down once its parent process is gone', async () => {
+    const logDir = mkdtempSync(join(tmpdir(), 'relay-parent-'))
+    logDirs.push(logDir)
+    const errFile = join(logDir, 'bridge.err')
+    // a parent that starts the bridge (stdin closed, stderr to a file), prints the bridge's pid and ready line, then waits to be killed
+    const parentSrc = `
+      const { spawn } = require('node:child_process')
+      const { openSync } = require('node:fs')
+      const err = openSync(process.env.ERR_FILE, 'w')
+      // detached: on Windows libuv puts a child in a kill-on-close job, so the parent's death would kill it outright
+      const c = spawn(process.execPath, [process.env.MAIN], { stdio: ['ignore', 'pipe', err], env: process.env, windowsHide: true, detached: true })
+      let buf = ''
+      let sent = false
+      c.stdout.setEncoding('utf8')
+      c.stdout.on('data', (d) => {
+        buf += d
+        if (sent || !buf.includes('\\n')) return
+        sent = true
+        process.stdout.write(JSON.stringify({ pid: c.pid, ready: JSON.parse(buf.split('\\n')[0]) }) + '\\n')
+      })
+      setInterval(() => {}, 1000)
+    `
+    const parent = spawn(process.execPath, ['-e', parentSrc], {
+      env: { ...process.env, MAIN, ERR_FILE: errFile, RELAY_WATCH_PARENT: '1', RELAY_FAKE_AGENT: FAKE },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    closers.push(() => {
+      if (parent.exitCode === null) parent.kill('SIGKILL')
+    })
+    let out = ''
+    parent.stdout.setEncoding('utf8')
+    parent.stdout.on('data', (d: string) => (out += d))
+    await waitFor(() => out.includes('\n'), 'the bridge pid from its parent', 30_000)
+    const { pid, ready } = JSON.parse(out.split('\n')[0]!)
+    closers.push(() => {
+      if (alive(pid)) process.kill(pid, 'SIGKILL')
+    })
+    expect(ready.type).toBe('ready')
+    const list = await fetch(`http://127.0.0.1:${ready.port}/tasks`, { headers: { authorization: `Bearer ${ready.token}` } })
+    expect(list.status).toBe(200)
+    expect(alive(pid)).toBe(true)
+
+    parent.kill('SIGKILL')
+    await waitFor(() => !alive(pid), 'the bridge to exit after its parent', 20_000)
+    expect(readFileSync(errFile, 'utf8')).toContain('shutting down (parent process gone)')
   }, 60_000)
 
   // Windows cannot deliver SIGTERM to a child as a catchable signal (it is a hard kill), so the signal path runs on POSIX only.

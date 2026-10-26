@@ -8,6 +8,22 @@ const write = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + '\n')
 console.log = console.info = console.debug = console.error
 
 const SHUTDOWN_GRACE_MS = 15_000
+const PARENT_POLL_MS = 2000
+
+// RELAY_WATCH_PARENT=1 (how the Claude Code mod starts us): the mod's $.process.spawn closes stdin from the start,
+// so stdin's end means nothing; the bridge instead lives while its parent process does, and stops on POST /shutdown.
+const watchParent = process.env.RELAY_WATCH_PARENT === '1'
+
+/** Whether a process is gone: `kill(pid, 0)` failing with ESRCH, or with EPERM (counted as gone too). */
+function parentGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    return code === 'ESRCH' || code === 'EPERM'
+  }
+}
 
 // Test-only crash injection: RELAY_TEST_CRASH=throw|reject makes the bridge crash once a task's turn is running.
 const crashMode = process.env.RELAY_TEST_CRASH
@@ -40,10 +56,12 @@ async function main(): Promise<void> {
     }
   })
   registryRef = registry
-  const server = await startServer(registry)
-
   let shuttingDown = false
-  const shutdown = async (why: string): Promise<void> => {
+  // declared before the server so POST /shutdown can call it; assigned below
+  let shutdown: (why: string) => Promise<void> = async () => {}
+  const server = await startServer(registry, { onShutdown: () => void shutdown('POST /shutdown') })
+
+  shutdown = async (why: string): Promise<void> => {
     if (shuttingDown) return
     shuttingDown = true
     console.error(`[bridge] shutting down (${why})`)
@@ -53,11 +71,18 @@ async function main(): Promise<void> {
   }
 
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGBREAK', 'SIGHUP'] as const) process.on(sig, () => void shutdown(sig))
-  process.stdin.on('end', () => void shutdown('stdin closed'))
-  process.stdin.on('close', () => void shutdown('stdin closed'))
-  process.stdin.on('error', () => void shutdown('stdin error'))
   process.stdout.on('error', () => void shutdown('stdout closed'))
-  process.stdin.resume()
+  if (watchParent) {
+    const parent = process.ppid
+    setInterval(() => {
+      if (parentGone(parent)) void shutdown('parent process gone')
+    }, PARENT_POLL_MS).unref()
+  } else {
+    process.stdin.on('end', () => void shutdown('stdin closed'))
+    process.stdin.on('close', () => void shutdown('stdin closed'))
+    process.stdin.on('error', () => void shutdown('stdin error'))
+    process.stdin.resume()
+  }
 
   write({ type: 'ready', port: server.port, token: server.token })
 }

@@ -52,17 +52,38 @@ function requestPaths(tc: PermissionParams['toolCall']): string[] | undefined {
   return out
 }
 
-/** Spellings that can alias another file on the filesystem; refuse them outright instead of reasoning about them. */
-function suspiciousPath(p: string): boolean {
+const components = (p: string) => p.split(/[\\/]+/).filter(Boolean)
+
+/**
+ * Spellings of the raw path that are refused outright: a URL, a `..` component (resolve() collapses it lexically,
+ * while the OS walks it through whatever the component before it really is), and on win32 a `:` anywhere but a
+ * leading drive designator (`C:\`), which opens an alternate data stream, a device path or a drive-relative path.
+ */
+function suspiciousRaw(p: string): boolean {
   if (p.includes('://')) return true
-  const parts = p.split(/[\\/]+/).filter(Boolean)
-  if (parts.some(isDotGit)) return true
-  if (parts.some((c) => /~\d/.test(c))) return true // 8.3 short names
-  if (process.platform === 'win32') {
-    // `:` is only legal as the drive designator; elsewhere it opens an alternate data stream (or a device path)
-    if (parts.some((c, i) => c.includes(':') && !(i === 0 && /^[a-z]:$/i.test(c)))) return true
-  }
+  if (components(p).includes('..')) return true
+  if (process.platform === 'win32' && p.replace(/^[a-z]:[\\/]/i, '').includes(':')) return true
   return false
+}
+
+/**
+ * Spellings below the worktree that can alias another file: a `.git` component under any NTFS spelling, an 8.3
+ * short name, on win32 a `:`. Checked on the part below the worktree only, so a worktree that itself lives under a short
+ * name (`C:\Users\KOOL~1\...`) still works.
+ */
+function suspiciousBelow(rel: string): boolean {
+  const parts = components(rel)
+  return parts.some(isDotGit) || parts.some((c) => /~\d/.test(c) || (process.platform === 'win32' && c.includes(':')))
+}
+
+/** An existing regular file with more than one hard link: an edit through it writes a file that may live anywhere. Fails closed. */
+function hardlinked(abs: string): boolean {
+  try {
+    const st = lstatSync(abs)
+    return st.isFile() && st.nlink > 1
+  } catch (e: any) {
+    return !(e?.code === 'ENOENT' || e?.code === 'ENOTDIR')
+  }
 }
 
 /**
@@ -103,9 +124,11 @@ function autoReason(tc: PermissionParams['toolCall'], worktree: string): string 
   const paths = requestPaths(tc)
   if (!paths || paths.length === 0) return undefined
   for (const p of paths) {
-    if (suspiciousPath(p)) return undefined
+    if (suspiciousRaw(p)) return undefined
     const abs = resolve(worktree, p)
-    if (suspiciousPath(abs) || !isInside(abs, worktree) || !realInside(abs, worktree)) return undefined
+    if (!isInside(abs, worktree) || suspiciousBelow(relative(resolve(worktree), abs))) return undefined
+    if (!realInside(abs, worktree)) return undefined
+    if (tc.kind === 'edit' && hardlinked(abs)) return undefined
   }
   return `${tc.kind} inside worktree: ${paths.join(', ')}`
 }
@@ -113,7 +136,9 @@ function autoReason(tc: PermissionParams['toolCall'], worktree: string): string 
 function escalate(p: PermissionParams, requestId: string): Decision {
   const tc: any = isObject(p) && isObject(p.toolCall) ? p.toolCall : {}
   const title = typeof tc.title === 'string' ? tc.title : typeof tc.kind === 'string' ? tc.kind : 'permission request'
-  const options = isObject(p) && Array.isArray(p.options) ? p.options : []
+  // "Always allow" is never offered: once chosen, the agent would stop asking and the relay would see nothing more.
+  // reject_always stays (it only ever makes the agent ask less for things it may not do).
+  const options = (isObject(p) && Array.isArray(p.options) ? p.options : []).filter((o) => !(isObject(o) && o.kind === 'allow_always'))
   return { action: 'claude', pending: { requestId, type: 'permission', title, toolKind: typeof tc.kind === 'string' ? tc.kind : undefined, rawInput: tc.rawInput, options } }
 }
 

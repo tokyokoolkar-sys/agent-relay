@@ -1,6 +1,6 @@
 import { type ChildProcess, execFile, execFileSync } from 'node:child_process'
 import { statSync } from 'node:fs'
-import { appendFile, lstat, mkdir, readFile, readdir, realpath, stat as statPath } from 'node:fs/promises'
+import { appendFile, lstat, mkdir, readFile, readdir, realpath, rmdir, stat as statPath, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -198,20 +198,34 @@ export async function createWorktree(repo: string, taskId: string): Promise<{ pa
   return { path, branch, base }
 }
 
-/** Throws RelayError('worktree_tampered') when `dir` is a relay worktree whose `.git` pointer was altered. */
-export async function isDirty(dir: string): Promise<boolean> {
-  return (await must(dir, ['status', '--porcelain', '--ignore-submodules=all'])).trim() !== ''
+/**
+ * Whether `dir` has changes. `untracked: false` counts only tracked files (the merge precondition: an untracked file
+ * of the user's does not stop a merge). Throws RelayError('worktree_tampered') when `dir` is a relay worktree whose
+ * `.git` pointer was altered.
+ */
+export async function isDirty(dir: string, opts: { untracked?: boolean } = {}): Promise<boolean> {
+  const args = ['status', '--porcelain', '--ignore-submodules=all', ...(opts.untracked === false ? ['--untracked-files=no'] : [])]
+  return (await must(dir, args)).trim() !== ''
 }
 
-/** Gitlinks (submodules) recorded in commit `base`: forward-slash path -> commit sha. */
-async function baseGitlinks(dir: string, base: string): Promise<Map<string, string>> {
-  const links = new Map<string, string>()
+/** Whether the index differs from HEAD (what a commit would record). */
+async function hasStagedChanges(dir: string): Promise<boolean> {
+  const r = await run(dir, ['diff', '--cached', '--quiet'])
+  if (r.code === 0) return false
+  if (r.code === 1) return true
+  throw new RelayError('git_failed', `git diff --cached failed: ${r.stderr.trim() || `exit ${r.code}`}`)
+}
+
+/** Every entry of commit `base` (blobs, links and gitlinks): forward-slash path -> its mode and sha. */
+async function baseEntries(dir: string, base: string): Promise<Map<string, { mode: string; sha: string }>> {
+  const entries = new Map<string, { mode: string; sha: string }>()
   for (const e of (await must(dir, ['ls-tree', '-r', '-z', '--full-tree', base])).split('\0')) {
-    if (!e.startsWith('160000 ')) continue // "<mode> <type> <sha>\t<path>"
-    const tab = e.indexOf('\t')
-    links.set(e.slice(tab + 1), e.slice(0, tab).split(' ')[2]!)
+    if (!e) continue
+    const tab = e.indexOf('\t') // "<mode> <type> <sha>\t<path>"
+    const [mode, , sha] = e.slice(0, tab).split(' ')
+    entries.set(e.slice(tab + 1), { mode: mode!, sha: sha! })
   }
-  return links
+  return entries
 }
 
 /** Case-insensitive file systems (the defaults on Windows and macOS): path comparisons fold case. */
@@ -262,12 +276,13 @@ export const isDotGit = (name: string) => {
   return base === '.git' || /^git~\d+$/.test(base)
 }
 
-type Findings = { nested: string[]; dirLinks: string[]; outside: string[] }
+type Findings = { nested: string[]; dirLinks: string[]; outside: string[]; hardlinks?: string[] }
 
 function refusal(f: Findings): RelayError | undefined {
   if (f.nested.length > 0) return new RelayError('nested_repo', `embedded git repositories are not allowed: ${f.nested.join(', ')}`)
   if (f.dirLinks.length > 0) return new RelayError('directory_link', `directory links (junctions, directory symlinks) are not allowed: ${f.dirLinks.join(', ')}`)
   if (f.outside.length > 0) return new RelayError('link_outside_worktree', `links pointing outside the worktree are not allowed: ${f.outside.join(', ')}`)
+  if (f.hardlinks && f.hardlinks.length > 0) return new RelayError('hardlink', `files with more than one hard link are not allowed: ${f.hardlinks.join(', ')}`)
   return undefined
 }
 
@@ -325,27 +340,32 @@ async function stagedEntries(dir: string): Promise<StagedEntry[]> {
 
 /**
  * Checks what `git add` actually staged, independently of the scan and of any ignore rule: every index entry (not
- * only changed ones; one cached lstat per directory plus one realpath per entry, run 32 at a time, stays well
- * under a second for a few thousand files). An entry is refused when a path component is `.git`, when it is a
- * gitlink that `base` does not have at that sha, when one of its ancestor directories is a link, or when its
- * real path is outside the worktree.
+ * only changed ones; one cached lstat per directory plus one lstat and one realpath per entry, run 32 at a time,
+ * stays well under a second for a few thousand files). An entry is refused when a path component is `.git`, when
+ * it is a gitlink that `base` does not have at that sha, when one of its ancestor directories is a link, when its
+ * real path is outside the worktree, when it is a link (mode 120000) whose link text, read from the staged blob,
+ * resolves outside the worktree (dangling or not, and whatever is on disk: with core.symlinks=false the link is a
+ * plain file), or when it is a regular file with more than one hard link (its content is shared with a file that
+ * may live anywhere on the volume). Links `base` already has, unchanged, are the user's own and are not judged.
  */
-async function verifyStaged(dir: string, entries: StagedEntry[], exempt: Map<string, string>): Promise<Findings> {
+async function verifyStaged(dir: string, entries: StagedEntry[], base: Map<string, { mode: string; sha: string }>): Promise<Findings> {
   const root = resolve(dir)
   const realRoot = await realpath(root)
   const nested = new Set<string>()
   const dirLinks = new Set<string>()
   const outside = new Set<string>()
+  const hardlinks = new Set<string>()
   const linkDirs = new Map<string, Promise<boolean>>()
+  const missing = (err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return undefined // not on disk (e.g. skip-worktree): nothing read
+    throw err
+  }
   const isLinkDir = (rel: string) => {
     let known = linkDirs.get(rel)
     if (!known) {
       known = lstat(join(root, rel)).then(
         (st) => st.isSymbolicLink(),
-        (err: NodeJS.ErrnoException) => {
-          if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return false
-          throw err
-        },
+        (err: NodeJS.ErrnoException) => missing(err) ?? false,
       )
       linkDirs.set(rel, known)
     }
@@ -353,16 +373,24 @@ async function verifyStaged(dir: string, entries: StagedEntry[], exempt: Map<str
   }
   const check = async ({ mode, sha, path }: StagedEntry) => {
     const parts = path.split('/')
+    const inBase = base.get(path)
+    const unchanged = inBase?.mode === mode && inBase.sha === sha
     if (parts.some(isDotGit)) nested.add(path)
-    if (mode === '160000' && exempt.get(path) !== sha) nested.add(path)
+    if (mode === '160000' && !unchanged) nested.add(path)
     for (let i = 1; i < parts.length; i++) {
       const ancestor = parts.slice(0, i).join('/')
       if (await isLinkDir(ancestor)) dirLinks.add(ancestor)
     }
-    const real = await realpath(join(root, path)).catch((err: NodeJS.ErrnoException) => {
-      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return undefined // not on disk (e.g. skip-worktree): nothing read
-      throw err
-    })
+    const full = join(root, path)
+    if (mode === '120000' && !unchanged) {
+      const text = await must(dir, ['cat-file', 'blob', sha])
+      if (!isInside(root, resolve(dirname(full), text))) outside.add(path)
+    }
+    if (mode === '100644' || mode === '100755') {
+      const st = await lstat(full).catch(missing)
+      if (st?.isFile() && st.nlink > 1) hardlinks.add(path)
+    }
+    const real = await realpath(full).catch(missing)
     if (real && !isInside(realRoot, real)) outside.add(path)
   }
   let next = 0
@@ -370,15 +398,24 @@ async function verifyStaged(dir: string, entries: StagedEntry[], exempt: Map<str
     while (next < entries.length) await check(entries[next++]!)
   }
   await Promise.all(Array.from({ length: Math.min(32, entries.length) }, worker))
-  return { nested: [...nested], dirLinks: [...dirLinks], outside: [...outside] }
+  return { nested: [...nested], dirLinks: [...dirLinks], outside: [...outside], hardlinks: [...hardlinks] }
 }
 
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
 
 /**
+ * Folders where the agents keep their own state (Command Code's taste notes, OpenCode's session data). Left out of
+ * every commit through pathspec excludes (never info/exclude: that file is shared with the main tree, where a real
+ * `.opencode/` project config must stay visible), unless `base` tracks something under one: then it is project
+ * content and is committed like anything else.
+ */
+const AGENT_STATE_DIRS = ['.commandcode', '.opencode']
+
+/**
  * Stages and commits everything as Agent Relay. Returns false when there was nothing to commit.
  * `base` is the sha `createWorktree` recorded. It, not the worktree's HEAD (which the agent can move by
- * committing), decides which gitlinks are legitimate.
+ * committing), decides which gitlinks and links are legitimate and which agent state folders are project content.
+ * `onLeftOut` hears which agent state folders exist and were left out (`.commandcode/`).
  *
  * After `add -A` the staged set itself is verified (see verifyStaged). On any violation the index is restored
  * with `read-tree HEAD` and commitAll throws, so nothing reaches a commit. A pre-add scan refuses the same
@@ -387,18 +424,22 @@ const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
  *   included), or a staged gitlink that is not in `base` at base's sha.
  * - RelayError('directory_link'): a junction or directory symlink (outside gitignored directories), or a staged
  *   path that goes through one.
- * - RelayError('link_outside_worktree'): a file link, or staged path, whose real target is outside the worktree.
+ * - RelayError('link_outside_worktree'): a file link, or staged path, whose real target is outside the worktree,
+ *   or a staged link whose link text resolves outside it.
+ * - RelayError('hardlink'): a staged regular file with more than one hard link.
  */
-export async function commitAll(dir: string, message: string, base: string): Promise<boolean> {
+export async function commitAll(dir: string, message: string, base: string, onLeftOut?: (dirs: string[]) => void): Promise<boolean> {
   if (!SHA.test(base)) throw new RelayError('bad_base', `base must be a full commit sha, got ${JSON.stringify(base)}`)
-  const exempt = await baseGitlinks(dir, base)
+  const inBase = await baseEntries(dir, base)
   const early = refusal(await scanWorktree(dir, await indexDirs(dir)))
   if (early) throw early
-  await must(dir, ['add', '-A'])
+  const tracked = new Set([...inBase.keys()].map((p) => fold(p.split('/')[0]!)))
+  const leaveOut = AGENT_STATE_DIRS.filter((d) => !tracked.has(fold(d)))
+  await must(dir, ['add', '-A', '--', ...leaveOut.map((d) => `:(top,exclude)${d}`)])
   const restoreIndex = () => run(dir, ['read-tree', 'HEAD'])
   let late: RelayError | undefined
   try {
-    late = refusal(await verifyStaged(dir, await stagedEntries(dir), exempt))
+    late = refusal(await verifyStaged(dir, await stagedEntries(dir), inBase))
   } catch (err) {
     await restoreIndex().catch(() => undefined) // a check that could not finish must not leave the staging behind
     throw err
@@ -408,9 +449,44 @@ export async function commitAll(dir: string, message: string, base: string): Pro
     if (restored.code !== 0) late.message += ` (restoring the index with read-tree HEAD failed: ${restored.stderr.trim() || `exit ${restored.code}`})`
     throw late
   }
-  if (!(await isDirty(dir))) return false
+  if (onLeftOut) {
+    const present = await Promise.all(leaveOut.map((d) => lstat(join(resolve(dir), d)).then(() => true, () => false)))
+    const dirs = leaveOut.filter((_, i) => present[i]).map((d) => `${d}/`)
+    if (dirs.length > 0) onLeftOut(dirs)
+  }
+  if (!(await hasStagedChanges(dir))) return false
   await must(dir, [...IDENTITY, 'commit', '--no-verify', '-m', message])
   return true
+}
+
+/**
+ * Removes a task's worktree (git's record of it and the directory), uncommitted files included. The branch stays.
+ * git leaves behind what it will not delete, such as a junction; the rest is removed here without ever following
+ * a link: a link is removed itself, never what it points to.
+ */
+export async function removeWorktree(repo: string, path: string): Promise<void> {
+  const wt = resolve(path)
+  await must(repo, ['worktree', 'remove', '--force', wt])
+  await removeTreeNoFollow(wt)
+}
+
+async function removeTreeNoFollow(p: string): Promise<void> {
+  const st = await lstat(p).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return undefined
+    throw err
+  })
+  if (!st) return
+  if (st.isSymbolicLink()) {
+    // a file link is unlinked; a junction or directory link is removed with rmdir, which drops the link only
+    await unlink(p).catch(() => rmdir(p))
+    return
+  }
+  if (st.isDirectory()) {
+    for (const name of await readdir(p)) await removeTreeNoFollow(join(p, name))
+    await rmdir(p)
+    return
+  }
+  await unlink(p)
 }
 
 export async function diff(repo: string, base: string, branch: string): Promise<{ stat: string; patch: string }> {
@@ -427,9 +503,14 @@ export async function merge(
   branch: string,
   message: string,
 ): Promise<{ ok: true; commit: string } | { ok: false; reason: 'dirty' | 'conflict'; paths: string[] }> {
-  if (await isDirty(repo)) return { ok: false, reason: 'dirty', paths: [] }
+  // untracked files do not count: git itself refuses a merge that would overwrite one, reported below
+  if (await isDirty(repo, { untracked: false })) return { ok: false, reason: 'dirty', paths: [] }
   const r = await run(repo, [...IDENTITY, 'merge', '--no-ff', '--no-verify', branch, '-m', message])
   if (r.code === 0) return { ok: true, commit: (await must(repo, ['rev-parse', 'HEAD'])).trim() }
+  // a merge git refused to start (an untracked file in the way, say) left nothing to abort
+  if ((await run(repo, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'])).code !== 0) {
+    throw new RelayError('merge_failed', `git merge failed: ${(r.stderr || r.stdout).trim()}`)
+  }
 
   const paths = (await run(repo, ['diff', '--name-only', '--diff-filter=U'])).stdout
     .split(/\r?\n/)

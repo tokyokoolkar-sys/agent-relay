@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -207,8 +207,57 @@ describe('classifyPermission', () => {
     expect(d.action).toBe('claude')
     if (d.action === 'claude') {
       expect(d.pending).toMatchObject({ requestId: 'r9', type: 'permission', title: 'git status', toolKind: 'execute' })
-      expect(d.pending.options).toHaveLength(3)
+      // the "always allow" option is never offered to Claude
+      expect(d.pending.options.map((o) => o.optionId)).toEqual(['once', 'reject'])
     }
+  })
+
+  it('strips allow_always but keeps reject_always from a Command Code permission sent to Claude', () => {
+    const p: PermissionParams = {
+      sessionId: 's1',
+      toolCall: { toolCallId: 't', title: 'Bash: npm test', kind: 'execute', rawInput: { command: 'npm test' } },
+      options: ccOptions,
+    }
+    const d = classifyPermission(p, WT, 'r')
+    expect(d.action).toBe('claude')
+    if (d.action === 'claude') expect(d.pending.options.map((o) => o.kind)).toEqual(['allow_once', 'reject_once', 'reject_always'])
+  })
+
+  it('keeps every answer of a Command Code question (option_N, all allow_once)', () => {
+    const p: PermissionParams = {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'q', title: 'Q', kind: 'other', rawInput: { question: 'Which?' } },
+      options: ['a', 'b', 'c'].map((n, i) => ({ optionId: `option_${i}`, name: n, kind: 'allow_once' })),
+    }
+    const d = classifyPermission(p, WT, 'r')
+    expect(d.action).toBe('question')
+    if (d.action === 'question') expect(d.pending.options.map((o) => o.optionId)).toEqual(['option_0', 'option_1', 'option_2'])
+  })
+
+  it('escalates an edit of an existing file that has another hard link; a read of it and plain files still auto-allow', () => {
+    const outside = join(base, 'outside-hl')
+    mkdirSync(outside, { recursive: true })
+    writeFileSync(join(outside, 'secret.txt'), 'top secret\n')
+    linkSync(join(outside, 'secret.txt'), join(WT, 'hl.txt'))
+    expect(classifyPermission(write(join(WT, 'hl.txt')), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(join(WT, 'hl.txt'), { kind: 'read', rawInput: { file_path: join(WT, 'hl.txt') } }), WT, 'r').action).toBe('auto')
+    writeFileSync(join(WT, 'plain.txt'), 'x')
+    expect(classifyPermission(write(join(WT, 'plain.txt')), WT, 'r').action).toBe('auto')
+  })
+
+  it('refuses a raw path with a .. component, even one that stays inside', () => {
+    expect(classifyPermission(write('sub/../a.txt'), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(`${WT}\\sub\\..\\a.txt`), WT, 'r').action).toBe('claude')
+    expect(classifyPermission(write(`${WT}/sub/../a.txt`), WT, 'r').action).toBe('claude')
+  })
+
+  it('auto-allows inside a worktree whose own path has an 8.3-style component (KOOL~1); still escalates one below it', () => {
+    const shortWt = join(base, 'KOOL~1', 'wt')
+    mkdirSync(join(shortWt, 'sub'), { recursive: true })
+    expect(classifyPermission(write(join(shortWt, 'sub', 'a.txt')), shortWt, 'r').action).toBe('auto')
+    expect(classifyPermission(write('sub/a.txt'), shortWt, 'r').action).toBe('auto')
+    expect(classifyPermission(write(join(shortWt, 'LONGFI~1.txt')), shortWt, 'r').action).toBe('claude')
+    expect(classifyPermission(write(join(shortWt, 'GIT~1', 'config')), shortWt, 'r').action).toBe('claude')
   })
 })
 

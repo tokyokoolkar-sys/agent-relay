@@ -108,7 +108,10 @@ export class TaskRegistry {
     return diff(req.repoPath, base, branch)
   }
 
-  /** Merges the task's branch into the main tree. One merge at a time, in request order. */
+  /**
+   * Merges the task's branch into the main tree. One merge at a time, in request order. A successful merge makes the
+   * task done and stops its agent.
+   */
   merge(id: string): Promise<Awaited<ReturnType<typeof merge>>> {
     const run = async () => {
       const { task, req } = this.#entry(id)
@@ -116,8 +119,27 @@ export class TaskRegistry {
       if (!s.branch) throw new RelayError('no_worktree', `task ${id} has no worktree`)
       if (BUSY.includes(s.status)) throw new RelayError('task_busy', `task ${id} is ${s.status}; its work is only on the branch once the turn has ended`)
       const title = s.title.replace(/\s+/g, ' ').trim()
-      return merge(req.repoPath, s.branch, `relay: merge ${id} ${title}`)
+      const result = await merge(req.repoPath, s.branch, `relay: merge ${id} ${title}`)
+      if (result.ok) await task.finish()
+      return result
     }
+    return this.#serialised(run)
+  }
+
+  /**
+   * Removes the task's worktree (git worktree remove --force), keeping its branch and the task. Refused while the
+   * agent works; runs in the merge queue so it never races a merge of the same branch.
+   */
+  cleanup(id: string): Promise<TaskSummary> {
+    const run = async () => {
+      const { task, req } = this.#entry(id)
+      await task.cleanup(req.repoPath)
+      return task.summary()
+    }
+    return this.#serialised(run)
+  }
+
+  #serialised<T>(run: () => Promise<T>): Promise<T> {
     const result = this.#mergeChain.then(run, run)
     this.#mergeChain = result.catch(() => {})
     return result

@@ -139,6 +139,7 @@ export async function startServer(reg: TaskRegistry, opts: ServerOptions = {}): 
       if (route('GET', 'tasks', ':id')) return send(res, 200, reg.get(id).detail(url.searchParams.get('full') === '1'))
       if (route('GET', 'tasks', ':id', 'diff')) return send(res, 200, await reg.diff(id))
       if (route('POST', 'tasks', ':id', 'merge')) return send(res, 200, await reg.merge(id))
+      if (route('POST', 'tasks', ':id', 'cleanup')) return send(res, 200, await reg.cleanup(id))
       if (route('POST', 'tasks', ':id', 'cancel')) {
         const task = reg.get(id)
         await task.cancel()

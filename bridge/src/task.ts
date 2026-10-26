@@ -4,7 +4,7 @@ import type { AgentSpec } from './agents.ts'
 import { isOutOfCredits, classifyPermission, type PermissionParams } from './policy.ts'
 import { RpcPeer } from './rpc.ts'
 import type { ActivityEntry, BridgeEvent, DelegateRequest, PendingRequest, TaskDetail, TaskStatus, TaskSummary, ThreadEntry } from './types.ts'
-import { RelayError, commitAll, createWorktree, killTree, killTreeSync } from './worktree.ts'
+import { RelayError, commitAll, createWorktree, killTree, killTreeSync, removeWorktree } from './worktree.ts'
 
 type ConfigOption = { id: string; category?: string; currentValue?: string; options?: { value: string; name: string }[] }
 type Outcome = { outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } }
@@ -14,6 +14,8 @@ const STDERR_LINES = 20
 const HANDSHAKE_TIMEOUT_MS = 60_000
 const PREVIEW_CHARS = 500
 const ACTIVITY_CAP = 1000
+/** A streamed (growing) activity entry is published at most this often; its final state always goes out. */
+const STREAM_EMIT_MS = 250
 const TERMINAL: readonly TaskStatus[] = ['done', 'failed', 'cancelled', 'out_of_credits']
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -23,7 +25,7 @@ class HandshakeTimeout extends Error {}
 function preview(input: unknown): string {
   const full = JSON.stringify(input ?? null)
   if (full.length <= PREVIEW_CHARS) return full
-  return `${full.slice(0, PREVIEW_CHARS)}…[truncated, ${full.length} chars — read relay_status {taskId, full:true} before approving]`
+  return `${full.slice(0, PREVIEW_CHARS)}…[truncated, ${full.length} chars — read relay_status {taskId} before approving]`
 }
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref())
 
@@ -64,6 +66,12 @@ export class Task {
 
   #thread: ThreadEntry[] = []
   #activity: ActivityEntry[] = []
+  #activitySeq = 0
+  /** The streamed entry whose latest text has not been published yet, and when it last was. */
+  #stream: { entry: ActivityEntry; lastEmitAt: number; timer: NodeJS.Timeout | undefined } | undefined
+  /** Agent state folders already noted on the thread as left out of the commits. */
+  #leftOutNoted = new Set<string>()
+  #worktreeRemoved = false
 
   constructor(opts: { id: string; spec: AgentSpec; req: DelegateRequest; emit: (e: BridgeEvent) => void; handshakeTimeoutMs?: number }) {
     this.id = opts.id
@@ -169,6 +177,7 @@ export class Task {
   }
 
   async cancel(): Promise<void> {
+    this.#flushStream()
     const wasTerminal = this.#isTerminal()
     if (!wasTerminal) {
       this.#status = 'cancelled'
@@ -183,6 +192,42 @@ export class Task {
     }
     this.#kill()
     await Promise.race([this.#closed, delay(5000)])
+  }
+
+  /** After a successful merge: the task is done; its agent (idle, if alive) is stopped. */
+  async finish(): Promise<void> {
+    this.#flushStream()
+    if (this.#status !== 'done') {
+      this.#status = 'done'
+      this.#waitingOnUser = false
+      this.#turnActive = false
+      this.#cancelPending()
+      this.#addThread('bridge', 'note', 'merged into the main tree; task done')
+      this.#changed()
+    }
+    this.#kill()
+    await Promise.race([this.#closed, delay(5000)])
+  }
+
+  /**
+   * Removes the task's worktree; the branch stays, and so does the task (same status, a thread note). Refused while
+   * the agent is working; an idle agent is cancelled first, since it would otherwise work on in a deleted folder.
+   */
+  async cleanup(repo: string): Promise<void> {
+    if (!this.#wt) throw new RelayError('no_worktree', `task ${this.id} has no worktree`)
+    if (['starting', 'running', 'asking', 'waiting_permission'].includes(this.#status)) {
+      throw new RelayError('task_busy', `task ${this.id} is ${this.#status}; cancel it or wait for its turn to end before cleaning up`)
+    }
+    if (this.#worktreeRemoved) return
+    if (!this.#isTerminal()) await this.cancel()
+    else {
+      this.#kill()
+      await Promise.race([this.#closed, delay(5000)])
+    }
+    await removeWorktree(repo, this.#wt.path)
+    this.#worktreeRemoved = true
+    this.#addThread('bridge', 'note', `worktree removed: ${this.#wt.path} (branch ${this.#wt.branch} kept)`)
+    this.#changed()
   }
 
   /** Commit the worktree branched from, once the worktree exists. */
@@ -303,6 +348,7 @@ export class Task {
 
   #fail(text: string): void {
     if (this.#isTerminal()) return
+    this.#flushStream()
     this.#status = 'failed'
     this.#waitingOnUser = false
     this.#addThread('bridge', 'error', text)
@@ -360,6 +406,7 @@ export class Task {
       await this.#onPromptError(err)
       return
     }
+    this.#flushStream() // the final text of a streamed entry always goes out
     if (this.#isTerminal()) return
 
     const lastMessage = this.#turnText
@@ -369,7 +416,7 @@ export class Task {
     // The agent is idle now (R15): the only moment it is safe to look at its worktree.
     let refusal: string | undefined
     try {
-      await commitAll(this.#wt!.path, `relay ${this.id}: ${this.#req.title}`, this.#wt!.base)
+      await commitAll(this.#wt!.path, `relay ${this.id}: ${this.#req.title}`, this.#wt!.base, (dirs) => this.#noteLeftOut(dirs))
     } catch (err) {
       refusal = err instanceof RelayError ? `${err.code}: ${err.message}` : `commit_failed: ${errText(err)}`
       this.#addThread('bridge', 'error', refusal)
@@ -475,27 +522,60 @@ export class Task {
     }
   }
 
+  /** A thought or message chunk grows the last entry of its kind (same id); its updates are throttled. */
   #chunk(kind: 'thought' | 'message', text: string): void {
     if (!text) return
     const last = this.#activity.at(-1)
     if (last?.kind === kind) {
       last.text += text
-      this.#emit({ type: 'activity', taskId: this.id, entry: { ...last } })
-    } else this.#pushActivity({ at: Date.now(), kind, text })
+      this.#streamed(last)
+    } else this.#pushActivity({ id: ++this.#activitySeq, at: Date.now(), kind, text })
+  }
+
+  /** Publishes a grown entry now when it last went out at least STREAM_EMIT_MS ago, else once that much has passed. */
+  #streamed(entry: ActivityEntry): void {
+    const now = Date.now()
+    const st = this.#stream?.entry === entry ? this.#stream : (this.#stream = { entry, lastEmitAt: 0, timer: undefined })
+    if (now - st.lastEmitAt >= STREAM_EMIT_MS) {
+      clearTimeout(st.timer)
+      st.timer = undefined
+      st.lastEmitAt = now
+      this.#emitActivity(entry)
+      return
+    }
+    st.timer ??= setTimeout(() => {
+      st.timer = undefined
+      st.lastEmitAt = Date.now()
+      this.#emitActivity(st.entry)
+    }, STREAM_EMIT_MS - (now - st.lastEmitAt)).unref()
+  }
+
+  /** Sends a streamed entry's final state if an update is still held back. */
+  #flushStream(): void {
+    const st = this.#stream
+    this.#stream = undefined
+    if (st?.timer === undefined) return
+    clearTimeout(st.timer)
+    this.#emitActivity(st.entry)
+  }
+
+  #emitActivity(entry: ActivityEntry): void {
+    this.#emit({ type: 'activity', taskId: this.id, entry: { ...entry } })
   }
 
   #onTool(u: any): void {
     const id: string | undefined = typeof u.toolCallId === 'string' ? u.toolCallId : undefined
     if (u.kind) this.#toolKinds.set(id ?? '', u.kind)
     const kind = u.kind ?? this.#toolKinds.get(id ?? '')
+    this.#flushStream() // a tool call ends the text streamed before it
     let entry = id ? this.#activity.findLast((a) => a.kind === 'tool' && a.toolCallId === id) : undefined
     if (!entry) {
-      entry = { at: Date.now(), kind: 'tool', text: u.title ?? 'tool call', toolCallId: id, status: u.status }
+      entry = { id: ++this.#activitySeq, at: Date.now(), kind: 'tool', text: u.title ?? 'tool call', toolCallId: id, status: u.status }
       this.#pushActivity(entry)
     } else {
       if (u.title) entry.text = u.title
       if (u.status) entry.status = u.status
-      this.#emit({ type: 'activity', taskId: this.id, entry: { ...entry } })
+      this.#emitActivity(entry) // tool updates are discrete status changes: never held back
     }
     let changed = false
     if (u.title && u.title !== this.#currentStep) {
@@ -525,9 +605,18 @@ export class Task {
   }
 
   #pushActivity(entry: ActivityEntry): void {
+    this.#flushStream()
     this.#activity.push(entry)
     if (this.#activity.length > ACTIVITY_CAP) this.#activity.splice(0, this.#activity.length - ACTIVITY_CAP)
-    this.#emit({ type: 'activity', taskId: this.id, entry: { ...entry } })
+    this.#emitActivity(entry)
+  }
+
+  /** Notes on the thread, once per folder, that agent state was left out of the commits. */
+  #noteLeftOut(dirs: string[]): void {
+    const fresh = dirs.filter((d) => !this.#leftOutNoted.has(d))
+    if (fresh.length === 0) return
+    for (const d of fresh) this.#leftOutNoted.add(d)
+    this.#addThread('bridge', 'note', `left out agent state: ${fresh.join(', ')}`)
   }
 
   // ---- bookkeeping --------------------------------------------------------------------------------------------

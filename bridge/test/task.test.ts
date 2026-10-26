@@ -394,6 +394,9 @@ describe('Task', () => {
     const total = JSON.stringify({ command }).length
     expect(text).toContain('truncated')
     expect(text).toContain(`${total} chars`)
+    // the full input is in relay_status {taskId}'s pending request: no `full` needed
+    expect(text).toContain('read relay_status {taskId} before approving')
+    expect(text).not.toContain('full')
     expect(text).not.toContain('x'.repeat(600))
     expect((m.task.detail(false).pending!.rawInput as { command: string }).command).toBe(command)
   })
@@ -407,6 +410,89 @@ describe('Task', () => {
     const failed = attentions(m.events).filter((a) => a.reason === 'failed')
     expect(failed).toHaveLength(1)
     expect(failed[0]!.text).toContain('4')
+  })
+
+  it('streams a long message as a few throttled activity events under one stable id, the last carrying the full text', async () => {
+    const parts = Array.from({ length: 200 }, (_, i) => `w${i} `)
+    const m = await make([[thought('pondering'), ...parts.map(msg), { stop: 'end_turn' }]])
+    await m.task.start()
+    await waitStatus(m, 'idle')
+    const acts = m.events.flatMap((e) => (e.type === 'activity' ? [e.entry] : []))
+    const messages = acts.filter((a) => a.kind === 'message')
+    expect(messages.length).toBeGreaterThan(0)
+    expect(messages.length).toBeLessThanOrEqual(5)
+    expect(messages.at(-1)!.text).toBe(parts.join(''))
+    expect(new Set(messages.map((a) => a.id)).size).toBe(1)
+    const thoughtEntry = acts.find((a) => a.kind === 'thought')!
+    expect(typeof thoughtEntry.id).toBe('number')
+    expect(thoughtEntry.id).not.toBe(messages[0]!.id)
+    expect(m.task.detail(true).activity!.map((a) => [a.id, a.kind])).toEqual([
+      [thoughtEntry.id, 'thought'],
+      [messages[0]!.id, 'message'],
+    ])
+  })
+
+  it('never offers or accepts an always-allow option, for either agent', async () => {
+    const ocOptions = [
+      { optionId: 'once', name: 'Allow once', kind: 'allow_once' },
+      { optionId: 'always', name: 'Always allow', kind: 'allow_always' },
+      { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+    ]
+    const cases = [
+      { agent: 'commandcode' as const, options: ccOptions, always: 'allow_always', once: 'allow_once' },
+      { agent: 'opencode' as const, options: ocOptions, always: 'always', once: 'once' },
+    ]
+    for (const c of cases) {
+      const m = await make(
+        [[{ permission: { toolCall: { toolCallId: 'p', title: 'Run: npm test', kind: 'execute', rawInput: { command: 'npm test' } }, options: c.options } }, { stop: 'end_turn' }]],
+        { agent: c.agent },
+      )
+      await m.task.start()
+      await waitStatus(m, 'waiting_permission')
+      const pending = m.task.summary().pending!
+      expect(pending.options.some((o) => o.kind === 'allow_always')).toBe(false)
+      expect(attentions(m.events)[0]!.text).not.toContain(`${c.always}:`)
+      expect(() => m.task.answer(pending.requestId, c.always)).toThrow(expect.objectContaining({ code: 'bad_option' }))
+      expect(m.task.summary().status).toBe('waiting_permission')
+      m.task.answer(pending.requestId, c.once)
+      await waitStatus(m, 'idle')
+      expect(m.task.summary().lastMessage).toBe(`answer:${c.once}`)
+    }
+  })
+
+  it('leaves agent state out of the commit and notes it on the thread, once', async () => {
+    const m = await make([
+      [{ writeFile: '.commandcode/taste/taste.md' }, { writeFile: 'a.txt' }, { stop: 'end_turn' }],
+      [{ writeFile: '.commandcode/taste/more.md' }, { writeFile: 'b.txt' }, { stop: 'end_turn' }],
+    ], { agent: 'commandcode' })
+    await m.task.start()
+    await waitStatus(m, 'idle')
+    await m.task.reply('more')
+    await waitFor(() => attentions(m.events).length === 2, 'the second turn to end')
+    const tree = await git(m.repo, 'ls-tree', '-r', '--name-only', 'relay/cc-1')
+    expect(tree).toContain('a.txt')
+    expect(tree).not.toContain('.commandcode')
+    const notes = m.task.detail(false).thread.filter((t) => t.from === 'bridge' && t.text.includes('left out agent state'))
+    expect(notes.map((t) => [t.kind, t.text])).toEqual([['note', 'left out agent state: .commandcode/']])
+  })
+
+  it('finish() marks an idle task done and kills its agent', async () => {
+    const m = await make([[msg('ok'), { stop: 'end_turn' }]])
+    await m.task.start()
+    await waitStatus(m, 'idle')
+    const pid = Number(/started pid=(\d+)/.exec(m.log())![1])
+    await m.task.finish()
+    expect(m.task.summary().status).toBe('done')
+    expect(statuses(m.events).at(-1)).toBe('done')
+    await waitFor(() => {
+      try {
+        process.kill(pid, 0)
+        return false
+      } catch {
+        return true
+      }
+    }, `agent ${pid} to be gone`, 5000)
+    await expect(m.task.reply('more')).rejects.toMatchObject({ code: 'not_idle' })
   })
 
   it('survives an emit handler that throws', async () => {

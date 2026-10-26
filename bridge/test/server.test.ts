@@ -265,6 +265,57 @@ describe('delegation', () => {
     expect([a.id, b.id].sort()).toEqual(['oc-5', 'oc-6'])
   })
 
+  it('a successful merge marks the task done and stops its agent', async () => {
+    const e = await boot()
+    const repo = await makeRepo()
+    const t = await delegate(e, repo)
+    await waitStatus(e, t.id, 'idle')
+    const pid = Number(/started pid=(\d+)/.exec(e.log())![1])
+    expect(alive(pid)).toBe(true)
+    const m = await call(e, 'POST', `/tasks/${t.id}/merge`)
+    expect(m.body.ok, JSON.stringify(m.body)).toBe(true)
+    expect(await status(e, t.id)).toBe('done')
+    expect(e.events.some((x) => x.type === 'task' && x.task.id === t.id && x.task.status === 'done')).toBe(true)
+    await waitFor(() => !alive(pid), 'the agent to be gone', 5000)
+  })
+
+  it('cleanup removes the worktree and keeps the branch and the task; refused while the agent works', async () => {
+    const e = await boot([[{ writeFile: 'a.txt' }], [{ hang: true }]])
+    const repo = await makeRepo()
+    const t = await delegate(e, repo)
+    await waitStatus(e, t.id, 'idle')
+    expect((await call(e, 'POST', `/tasks/${t.id}/reply`, { text: 'more' })).status).toBe(200)
+    const busy = await call(e, 'POST', `/tasks/${t.id}/cleanup`)
+    expect(busy.status).toBe(400)
+    expect(busy.body.code).toBe('task_busy')
+    expect(existsSync(t.worktree)).toBe(true)
+
+    await call(e, 'POST', `/tasks/${t.id}/cancel`)
+    const r = await call(e, 'POST', `/tasks/${t.id}/cleanup`)
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(r.body.status).toBe('cancelled')
+    expect(existsSync(t.worktree)).toBe(false)
+    expect(await git(repo, 'branch', '--list', `relay/${t.id}`)).toContain(`relay/${t.id}`)
+    expect((await call(e, 'GET', '/tasks')).body.map((x: TaskSummary) => x.id)).toEqual([t.id])
+    const thread = ((await call(e, 'GET', `/tasks/${t.id}`)).body as TaskDetail).thread
+    expect(thread.some((x) => x.from === 'bridge' && x.kind === 'note' && x.text.includes('worktree removed'))).toBe(true)
+    // the branch's work can still be read and merged
+    expect((await call(e, 'GET', `/tasks/${t.id}/diff`)).body.stat).toContain('a.txt')
+  })
+
+  it('cleanup after a merge keeps the task done', async () => {
+    const e = await boot()
+    const repo = await makeRepo()
+    const t = await delegate(e, repo)
+    await waitStatus(e, t.id, 'idle')
+    expect((await call(e, 'POST', `/tasks/${t.id}/merge`)).body.ok).toBe(true)
+    const r = await call(e, 'POST', `/tasks/${t.id}/cleanup`)
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(r.body.status).toBe('done')
+    expect(existsSync(t.worktree)).toBe(false)
+    expect((await call(e, 'POST', '/tasks/oc-99/cleanup')).status).toBe(404)
+  })
+
   it('refuses to merge a task that is still working', async () => {
     const e = await boot([{ hang: true }])
     const repo = await makeRepo()

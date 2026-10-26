@@ -1,5 +1,7 @@
-import { exec } from 'node:child_process'
-import { join } from 'node:path'
+import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import type { AgentId } from './types.ts'
 
 export type AgentSpec = {
@@ -42,11 +44,22 @@ export function agentSpec(id: AgentId, npmRoot: string): AgentSpec {
   return base
 }
 
-/** `npm root -g`, resolved once at startup by the caller. */
-export function resolveNpmRoot(): Promise<string> {
+/**
+ * The global npm root (`npm root -g`), resolved once at startup by the caller. Never through a shell: cmd.exe would
+ * look for `npm` in the current directory first, so a planted npm.cmd there would run. Instead node runs the
+ * npm-cli.js that ships beside it, from the temp dir; without one, the default Windows location
+ * `%APPDATA%\npm\node_modules` is assumed. `execPath` and `appData` are for tests.
+ */
+export function resolveNpmRoot(opts: { execPath?: string; appData?: string } = {}): Promise<string> {
+  const execPath = opts.execPath ?? process.execPath
+  const appData = opts.appData ?? process.env.APPDATA ?? ''
+  const cli = join(dirname(execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+  if (!existsSync(cli)) {
+    if (appData === '') return Promise.reject(new Error(`could not resolve the global npm root: no ${cli} and no APPDATA`))
+    return Promise.resolve(join(appData, 'npm', 'node_modules'))
+  }
   return new Promise((resolve, reject) => {
-    // npm is npm.cmd on Windows, which can only run through a shell; the command is a constant.
-    exec('npm root -g', { windowsHide: true }, (err, stdout) => {
+    execFile(execPath, [cli, 'root', '-g'], { cwd: tmpdir(), windowsHide: true }, (err, stdout) => {
       if (err) reject(new Error(`could not resolve the global npm root: ${err.message}`))
       else resolve(stdout.trim())
     })

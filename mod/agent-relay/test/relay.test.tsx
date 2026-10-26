@@ -911,19 +911,61 @@ describe('tools', () => {
     world.stdout.close()
   })
 
-  it('relay_diff caps the patch at 60000 characters and keeps the stat whole', async ($, on) => {
+  it('relay_diff pages a long patch 60000 characters at a time, with nextOffset, the stat whole on every page', async ($, on) => {
     const world = worldOf(on)
     const stat = ` big.txt | 9000 ${'+'.repeat(200)}\n`
-    const patch = 'p'.repeat(70_000)
+    const patch = `${'a'.repeat(60_000)}${'b'.repeat(60_000)}${'c'.repeat(10_000)}`
     world.respond = () => ({ status: 200, body: { stat, patch } })
+    const page = async (args: Record<string, unknown> = {}) => {
+      const r = await $.tool.call({ tool: TOOL('relay_diff'), taskId: 'cc-1', ...args })
+      expect(r.deny).toBeUndefined()
+
+      return framed(r.result)
+    }
 
     await start($, world)
-    const diff = framed((await $.tool.call({ tool: TOOL('relay_diff'), taskId: 'cc-1' })).result)
+    const first = await page()
+    expect(first.stat).toBe(stat)
+    expect(first.nextOffset).toBe(60_000)
+    expect(first.patch).toBe(
+      `${'a'.repeat(60_000)}…[patch page truncated at 60000 of 130000 chars — call relay_diff {taskId, offset: 60000} for the rest]`,
+    )
+    const second = await page({ offset: first.nextOffset })
+    expect(second.stat).toBe(stat)
+    expect(second.nextOffset).toBe(120_000)
+    expect(second.patch).toBe(
+      `${'b'.repeat(60_000)}…[patch page truncated at 120000 of 130000 chars — call relay_diff {taskId, offset: 120000} for the rest]`,
+    )
+    const last = await page({ offset: second.nextOffset })
+    expect(last.patch).toBe('c'.repeat(10_000))
+    expect('nextOffset' in last).toBe(false)
+    // the pages, notes left out, are the whole patch
+    const body = (t: string) => t.replace(/…\[patch page truncated at .*$/, '')
+    expect(body(first.patch) + body(second.patch) + body(last.patch)).toBe(patch)
+    // every page asks the bridge for the same full diff
+    expect(world.fetched.map(f => f.url)).toEqual([`${BASE}/tasks/cc-1/diff`, `${BASE}/tasks/cc-1/diff`, `${BASE}/tasks/cc-1/diff`])
 
-    expect(diff.stat).toBe(stat)
-    expect(diff.patch).toBe(`${'p'.repeat(60_000)}…[patch truncated, 70000 chars; stat is complete]`)
     world.respond = () => ({ status: 200, body: { stat, patch: 'short' } })
-    expect(framed((await $.tool.call({ tool: TOOL('relay_diff'), taskId: 'cc-1' })).result).patch).toBe('short')
+    const short = await page()
+    expect(short.patch).toBe('short')
+    expect('nextOffset' in short).toBe(false)
+    for (const offset of [-1, 1.5, 'x']) {
+      expect((await $.tool.call({ tool: TOOL('relay_diff'), taskId: 'cc-1', offset })).deny).toContain('offset')
+    }
+    world.stdout.close()
+  })
+
+  it("relay_merge's description forbids merging with a page of the diff unread", async ($, on) => {
+    const world = worldOf(on)
+
+    await $.session.start(SESSION)
+    await waitFor($, () => world.registered.length === TOOL_NAMES.length, 'the tools')
+    expect(world.registered.find(t => t.name === 'relay_merge')?.description).toContain(
+      'Never merge while any page of relay_diff is unread.',
+    )
+    expect(world.registered.find(t => t.name === 'relay_diff')?.inputSchema).toMatchObject({
+      properties: { offset: { type: 'integer' } },
+    })
     world.stdout.close()
   })
 

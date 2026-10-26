@@ -85,25 +85,29 @@ describe('staged symlinks', () => {
     await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'link_outside_worktree', message: expect.stringContaining('ext') })
   })
 
-  it('commits a symlink whose relative link text stays inside the worktree', async () => {
+  it('commits a symlink whose relative link text stays inside the worktree without climbing', async () => {
     const repo = await makeRepo()
     const wt = await createWorktree(repo, 'oc-1')
     await mkdir(join(wt.path, 'sub'))
+    await writeFile(join(wt.path, 'sub', 'a.txt'), 'a\n')
     if (!(await trySymlink('README.md', join(wt.path, 'readme-link')))) return
-    await trySymlink(join('..', 'README.md'), join(wt.path, 'sub', 'up-link'))
+    await trySymlink('sub/a.txt', join(wt.path, 'down-link'))
     expect(await commitAll(wt.path, 'link', wt.base)).toBe(true)
     expect(await git(wt.path, 'ls-tree', 'HEAD', 'readme-link')).toContain('120000')
-    expect(await git(wt.path, 'ls-tree', 'HEAD', 'sub/up-link')).toContain('120000')
+    expect(await git(wt.path, 'ls-tree', 'HEAD', 'down-link')).toContain('120000')
   })
 
-  /** A worktree whose base has a link `l` checked out as a plain file (core.symlinks=false): writing `l` sets link text. */
-  async function linkAsPlainFile() {
+  /**
+   * A worktree whose base has links (`l` by default) checked out as plain files (core.symlinks=false): writing one
+   * sets its link text, and git stages it as a link again.
+   */
+  async function linkAsPlainFile(names: string[] = ['l']) {
     const repo = await makeRepo()
     await writeFile(join(repo, 'linktext.tmp'), 'README.md')
     const sha = await git(repo, 'hash-object', '-w', 'linktext.tmp')
     await rm(join(repo, 'linktext.tmp'))
-    await git(repo, 'update-index', '--add', '--cacheinfo', `120000,${sha},l`)
-    await git(repo, 'commit', '-m', 'a link')
+    for (const name of names) await git(repo, 'update-index', '--add', '--cacheinfo', `120000,${sha},${name}`)
+    await git(repo, 'commit', '-m', 'links')
     await git(repo, 'config', 'core.symlinks', 'false')
     return createWorktree(repo, 'oc-1')
   }
@@ -116,6 +120,7 @@ describe('staged symlinks', () => {
     ['a UNC path', () => '\\\\server\\share\\x'],
     ['a device path', () => '\\\\?\\C:\\x'],
     ['a relative path that climbs out', () => '../../../../x'],
+    ['a plain ../x', () => '../x'],
   ])('refuses link text that is %s', async (_what, text) => {
     const wt = await linkAsPlainFile()
     await writeFile(join(wt.path, 'l'), text(wt.path))
@@ -128,10 +133,23 @@ describe('staged symlinks', () => {
     await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'suspicious_link', message: expect.stringContaining('l') })
   })
 
-  it('accepts link text that stays inside after climbing within the worktree', async () => {
+  it('refuses any .. in link text, even one that stays inside lexically (R33)', async () => {
     const wt = await linkAsPlainFile()
     await writeFile(join(wt.path, 'l'), 'sub/../README.md')
-    expect(await commitAll(wt.path, 'ok', wt.base)).toBe(true)
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'link_outside_worktree', message: expect.stringContaining('l') })
+  })
+
+  it('refuses a chain: link a -> b/../.. where b is itself a staged link (R33)', async () => {
+    const wt = await linkAsPlainFile(['a', 'b'])
+    await mkdir(join(wt.path, 'deep', 'er'), { recursive: true })
+    // b points two levels down; a climbs through it. Lexically b/../.. is the root, but the OS walks b first.
+    await writeFile(join(wt.path, 'b'), 'deep/er')
+    await writeFile(join(wt.path, 'a'), 'b/../..')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'link_outside_worktree', message: expect.stringContaining('allowed: a') })
+    // and the same through a link base already has, unchanged
+    await writeFile(join(wt.path, 'b'), 'README.md')
+    await writeFile(join(wt.path, 'a'), 'b/../README.md')
+    await expect(commitAll(wt.path, 'nope', wt.base)).rejects.toMatchObject({ code: 'link_outside_worktree' })
   })
 })
 

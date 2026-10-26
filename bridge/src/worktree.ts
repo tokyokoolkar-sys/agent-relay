@@ -366,7 +366,7 @@ async function stagedEntries(dir: string): Promise<StagedEntry[]> {
  * stays well under a second for a few thousand files). An entry is refused when a path component is `.git`, when
  * it is a gitlink that `base` does not have at that sha, when one of its ancestor directories is a link, when its
  * real path is outside the worktree, when it is a link (mode 120000) whose link text, read from the staged blob, is
- * absolute or resolves (relative to the worktree) outside it or onto a `.git`, 8.3 or `:` component (dangling or
+ * absolute, has any `..` component, or resolves (relative to the worktree) outside it or onto a `.git`, 8.3 or `:` component (dangling or
  * not, and whatever is on disk: with core.symlinks=false the link is a plain file), or when it is a regular file with more than one hard link (its content is shared with a file that
  * may live anywhere on the volume). Links `base` already has, unchanged, are the user's own and are not judged.
  */
@@ -409,7 +409,9 @@ async function verifyStaged(dir: string, entries: StagedEntry[], base: Map<strin
       // judged as text, relative to the worktree: never against the absolute worktree path, never on disk
       const text = await must(dir, ['cat-file', 'blob', sha])
       const target = posix.normalize(posix.join(posix.dirname(path), text.replaceAll('\\', '/')))
-      if (absoluteLinkText(text) || target === '..' || target.startsWith('../')) outside.add(path)
+      // any `..` is refused (R33): resolved lexically it can hide a climb through another link (`a` -> `b/../..`)
+      const climbs = text.split(/[\\/]+/).includes('..')
+      if (absoluteLinkText(text) || climbs || target === '..' || target.startsWith('../')) outside.add(path)
       else if (hasAliasingComponent(target)) suspicious.add(path)
     }
     if (mode === '100644' || mode === '100755') {

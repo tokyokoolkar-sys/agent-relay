@@ -570,11 +570,12 @@ export class Task {
     this.#flushStream() // a tool call ends the text streamed before it
     let entry = id ? this.#activity.findLast((a) => a.kind === 'tool' && a.toolCallId === id) : undefined
     if (!entry) {
-      entry = { id: ++this.#activitySeq, at: Date.now(), kind: 'tool', text: u.title ?? 'tool call', toolCallId: id, status: u.status }
+      entry = { id: ++this.#activitySeq, at: Date.now(), kind: 'tool', text: u.title ?? 'tool call', toolCallId: id, status: u.status, toolKind: kind }
       this.#pushActivity(entry)
     } else {
       if (u.title) entry.text = u.title
       if (u.status) entry.status = u.status
+      if (kind) entry.toolKind = kind
       this.#emitActivity(entry) // tool updates are discrete status changes: never held back
     }
     let changed = false

@@ -1,6 +1,6 @@
 {
   "name": "agent-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Delegate build work from Claude to OpenCode and Command Code agents through a local bridge, and follow their tasks.",
   "author": {
     "name": "Kool"

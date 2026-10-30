@@ -31,6 +31,8 @@ export type ActivityEntry = {
   text: string
   toolCallId?: string
   status?: string
+  /** The ACP kind of a tool call: read, edit, execute, search, ... */
+  toolKind?: string
 }
 
 export type PendingRequest = {

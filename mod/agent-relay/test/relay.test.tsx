@@ -2,6 +2,8 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, Plugin, TestBody, TestOptions } from 'claude-code/testing'
 import type { HttpResponse, On } from 'claude-code'
 
+import { cardHeight, cardSvg, escapeXml, railLine, railOf, targetOf } from '../hooks/card'
+import type { CardLook } from '../hooks/card'
 import type { ActivityEntry, TaskSummary } from '../types'
 
 const TOOL = (name: string): `mcp__agent-relay__${string}` => `mcp__agent-relay__${name}`
@@ -1138,22 +1140,32 @@ describe('pane', () => {
       }),
       summary({ id: 'oc-1', agent: 'opencode', title: 'Write docs', model: undefined, status: 'idle', costUsd: 0 }),
     )
-    for (const surface of SURFACES) {
-      const ui = await $.ui.mount({ ...PANE, surface })
+    const terminal = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await terminal.find({ type: 'Button', key: 'card:cc-1' }))?.text).toBe('Show details · running')
+    expect((await terminal.find({ type: 'Button', key: 'card:oc-1' }))?.text).toBe('Show details · idle')
+    const shown = await texts(terminal)
+    expect(shown).toContain('Add login')
+    expect(shown).toContain('Command Code · deepseek-v4 · effort: high')
+    expect(shown).toContain('Editing src/login.ts')
+    expect(shown).toContain('2 files · 1m 05s · $0.0123')
+    expect(shown).toContain('OpenCode · default model')
+    expect(shown).toContain('0 files · 0s · $0.0000')
+    expect(shown).not.toContain(EMPTY)
+    // collapsed: no Stop, no brief
+    expect(await terminal.find({ type: 'Button', key: 'stop:cc-1' })).toBeUndefined()
+    await terminal.unmount()
 
-      expect((await ui.find({ type: 'Button', key: 'card:cc-1' }))?.text).toBe('Command Code · Add login  running')
-      expect((await ui.find({ type: 'Button', key: 'card:oc-1' }))?.text).toBe('OpenCode · Write docs  idle')
-      const shown = await texts(ui)
-      expect(shown).toContain('deepseek-v4 · effort: high')
-      expect(shown).toContain('Editing src/login.ts')
-      expect(shown).toContain('2 files · 1m 05s · $0.0123')
-      expect(shown).toContain('default model')
-      expect(shown).toContain('0 files · 0s · $0.0000')
-      expect(shown).not.toContain(EMPTY)
-      // collapsed: no Stop, no brief
-      expect(await ui.find({ type: 'Button', key: 'stop:cc-1' })).toBeUndefined()
-      await ui.unmount()
+    const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const svgs = await desktop.findAll({ type: 'Svg' })
+    expect(svgs.length).toBe(2)
+    const running = String(svgs[0]?.props.source)
+    for (const part of ['Add login', 'running', 'Command Code · deepseek-v4', 'Editing src/login.ts', '2 files · 1m 05s · $0.0123']) {
+      expect(running).toContain(part)
     }
+    expect(svgs[0]?.props.alt).toContain('Add login')
+    expect(svgs[0]?.props.height).toBe(cardHeight({}))
+    expect((await desktop.findAll({ type: 'Box' })).filter(b => b.props.borderStyle === 'round')).toEqual([])
+    await desktop.unmount()
     world.stdout.close()
   })
 
@@ -1172,11 +1184,15 @@ describe('pane', () => {
     ]
 
     await withTasks($, world, ...words.map(([status], i) => summary({ id: `cc-${i + 1}`, status })))
-    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
     for (const [i, [, word]] of words.entries()) {
-      expect((await ui.find({ type: 'Button', key: `card:cc-${i + 1}` }))?.text).toBe(`Command Code · Add login  ${word}`)
+      expect((await ui.find({ type: 'Button', key: `card:cc-${i + 1}` }))?.text).toBe(`Show details · ${word}`)
     }
     await ui.unmount()
+    const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const svgs = await desktop.findAll({ type: 'Svg' })
+    for (const [i, [, word]] of words.entries()) expect(String(svgs[i]?.props.source)).toContain(word)
+    await desktop.unmount()
     world.stdout.close()
   })
 
@@ -1195,17 +1211,23 @@ describe('pane', () => {
         waitingOnUser: true,
       }),
     )
-    for (const surface of SURFACES) {
-      const ui = await $.ui.mount({ ...PANE, surface })
-      const shown = await texts(ui)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const shown = await texts(ui)
+    expect(shown).toContain('Question: Which database should I use?')
+    expect(shown).toContain('Claude is answering')
+    expect(shown).toContain('Permission: Bash: npm install pg')
+    expect(shown).toContain('Waiting on you')
+    expect(shown.indexOf('Claude is answering')).toBeLessThan(shown.indexOf('Waiting on you'))
+    await ui.unmount()
 
-      expect(shown).toContain('Question: Which database should I use?')
-      expect(shown).toContain('Claude is answering')
-      expect(shown).toContain('Permission: Bash: npm install pg')
-      expect(shown).toContain('Waiting on you')
-      expect(shown.indexOf('Claude is answering')).toBeLessThan(shown.indexOf('Waiting on you'))
-      await ui.unmount()
-    }
+    const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const [asking, permission] = await desktop.findAll({ type: 'Svg' })
+    expect(String(asking?.props.source)).toContain('Question: Which database should I use?')
+    expect(String(asking?.props.source)).toContain('Claude is answering')
+    expect(String(permission?.props.source)).toContain('Permission: Bash: npm install pg')
+    expect(String(permission?.props.source)).toContain('Waiting on you')
+    expect(asking?.props.height).toBe(cardHeight({ pending: { title: '', who: '' } }))
+    await desktop.unmount()
     world.stdout.close()
   })
 
@@ -1241,8 +1263,7 @@ describe('pane', () => {
       ])
       expect((await stateOf($)).expanded).toBe('cc-1')
       const shown = await texts(ui)
-      expect(shown).toContain('Model: deepseek-v4')
-      expect(shown).toContain('Effort: high')
+      expect(shown).toContain('Model deepseek-v4 · effort high')
       expect(shown).toContain('Command Code (question): Which database?')
       expect(shown).toContain('Claude: Use Postgres.')
       expect(shown).toContain('You (answer): SQLite instead.')
@@ -1384,7 +1405,7 @@ describe('pane', () => {
     await waitFor($, async () => (await tasksOf($)).length === 1, 'the task')
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
 
-    expect((await ui.find({ type: 'Button', key: 'card:cc-7' }))?.text).toBe('Command Code ·   running')
+    expect((await ui.find({ type: 'Button', key: 'card:cc-7' }))?.text).toBe('Show details · running')
     expect(await texts(ui)).toContain('0 files · 0s · $0.0000')
     await ui.unmount()
   })
@@ -1408,7 +1429,7 @@ describe('pane', () => {
       const ui = await $.ui.mount({ ...PANE, surface })
       const shown = await texts(ui)
       expect(shown[0]).toBe('Bridge stopped: the bridge exited with code 1. Cards may be stale.')
-      expect((await ui.find({ type: 'Button', key: 'card:cc-1' }))?.text).toBe('Command Code · Add login  running')
+      expect((await ui.find({ type: 'Button', key: 'card:cc-1' }))?.text).toMatch(/^Show details/)
       await ui.unmount()
     }
   })
@@ -1440,5 +1461,103 @@ describe('operating rules', () => {
     expect(rules?.text).toBe(RULES)
     expect(rules?.text).toContain('relay_credits')
     world.stdout.close()
+  })
+})
+
+const tool = (id: number, text: string, toolKind?: string): ActivityEntry => ({ id, at: id, kind: 'tool', text, ...(toolKind !== undefined ? { toolKind } : {}) })
+const LOOK: CardLook = {
+  title: 'Add login',
+  status: 'running',
+  tone: 'plain',
+  meta: 'OpenCode · glm',
+  rail: [{ verb: 'Read', count: 1 }, { verb: 'Write', count: 2 }],
+  target: 'src/Login.tsx',
+  numbers: '1 file · 2s · $0.0000',
+  isWorking: true,
+}
+
+describe('step rail', () => {
+  test('follows the tools in order, collapses repeats, and names steps by kind', () => {
+    const rail = railOf([
+      { id: 1, at: 1, kind: 'thought', text: 'hmm' },
+      tool(2, 'read', 'read'),
+      tool(3, 'Write: C:\\r\\a.ts', 'edit'),
+      tool(4, 'write', 'edit'),
+      tool(5, 'git status', 'execute'),
+      tool(6, 'ask_user_question', 'other'),
+      tool(7, 'Lookup: x', 'other'),
+    ])
+    expect(rail.map(s => [s.verb, s.count])).toEqual([['Read', 1], ['Write', 2], ['Run', 1], ['Ask', 1], ['Lookup', 1]])
+  })
+
+  test('shows only the last few steps', () => {
+    const rail = railOf(['read', 'edit', 'execute', 'search', 'fetch'].map((k, i) => tool(i, k, k)))
+    expect(railLine(rail)).toBe('… › Write › Run › Search › Fetch')
+  })
+
+  test("a step's target drops the tool name and keeps a path's last two parts", () => {
+    expect(targetOf('Write: C:\\repo\\src\\Login.tsx')).toBe('src/Login.tsx')
+    expect(targetOf('Shell: git status')).toBe('git status')
+    expect(targetOf('read')).toBe('')
+    expect(targetOf('edit', 'src/a.ts')).toBe('src/a.ts')
+    expect(targetOf('ls')).toBe('ls')
+  })
+})
+
+describe('shimmer card', () => {
+  test('working: a sweeping copy of the text, hidden under reduced motion', () => {
+    const svg = cardSvg(LOOK)
+    expect(svg).toContain('<animate attributeName="x1"')
+    expect(svg).toContain('class="sheen motion"')
+    expect(svg).toContain('preserveAspectRatio="xMinYMin meet"')
+    expect(svg).toContain('@media (prefers-reduced-motion:reduce){.motion{display:none}}')
+  })
+
+  test('working: a light runs along the outline, on the same clock as the shimmer', () => {
+    const svg = cardSvg(LOOK)
+    expect(svg).toContain('attributeName="stroke-dashoffset"')
+    expect(svg).toContain('pathLength="100"')
+    const clocks = [...svg.matchAll(/attributeName="(?:x1|stroke-dashoffset)"[^>]*dur="([^"]+)"/g)].map(m => m[1])
+    expect(clocks.length).toBe(3)
+    expect(new Set(clocks).size).toBe(1)
+  })
+
+  test('not working: static, nothing moves', () => {
+    const svg = cardSvg({ ...LOOK, isWorking: false })
+    expect(svg).not.toContain('<animate')
+    expect(svg).not.toContain('sheen motion')
+    expect(svg).not.toContain('stroke-dashoffset')
+    expect(svg).not.toContain('class="motion"')
+  })
+
+  test('agent text cannot become markup', () => {
+    const evil = '</text><script>alert(1)</script><a href="x">&'
+    const svg = cardSvg({ ...LOOK, title: evil, target: evil, meta: evil, numbers: evil, status: evil, rail: [{ verb: evil, count: 1 }], pending: { title: evil, who: evil } })
+    expect(svg).not.toContain('<script')
+    expect(svg).not.toContain('<a ')
+    expect(escapeXml(evil)).toBe('&lt;/text&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;a href=&quot;x&quot;&gt;&amp;')
+    expect(escapeXml('a\u0001b\ud800c')).toBe('abc')
+  })
+
+  paneIt('the pane animates only a working card, and the rail comes from its activity', async ($, on) => {
+    const world = worldOf(on)
+    await withTasks($, world, summary({ status: 'running' }), summary({ id: 'oc-1', agent: 'opencode', status: 'waiting_permission' }))
+    world.line({ type: 'activity', taskId: 'cc-1', entry: tool(1, 'read', 'read') })
+    world.line({ type: 'activity', taskId: 'cc-1', entry: tool(2, 'git status', 'execute') })
+    await waitFor($, async () => ((await stateOf($)).activity?.['cc-1'] ?? []).length === 2, 'the activity')
+
+    const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const [working, waiting] = await desktop.findAll({ type: 'Svg' })
+    expect(String(working?.props.source)).toContain('<animate')
+    expect(String(working?.props.source)).toContain('Read')
+    expect(working?.props.isInteractive).toBe(true)
+    expect(String(waiting?.props.source)).not.toContain('<animate')
+    expect(waiting?.props.isInteractive).toBeUndefined()
+    await desktop.unmount()
+
+    const terminal = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await terminal.findAll({ type: 'Svg' })).toEqual([])
+    expect(await texts(terminal)).toContain('Read › Run')
+    await terminal.unmount()
   })
 })

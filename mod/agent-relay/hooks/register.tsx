@@ -1,6 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register, ThemeKey, Timer } from 'claude-code'
 
+import { CARD_WIDTH, cardHeight, cardSvg, railLine, railOf, targetOf } from './card'
 import type { ActivityEntry, AgentId, AttentionReason, BridgeState, CardDetail, TaskStatus, TaskSummary, ThreadEntry } from '../types'
 
 // The agent relay: one bridge process per session (bridge/src/main.ts, run with
@@ -48,6 +49,9 @@ const EMPTY_TEXT = 'No delegated tasks yet. Ask Claude to delegate build work to
 /** The activity lines an expanded card shows: the newest. */
 const ACTIVITY_SHOWN = 30
 /** The statuses whose card offers Stop: every one in which the agent's process is alive. */
+/** The agent is at work: its card shimmers. Waiting on an answer is not work: that card holds still. */
+const WORKING_STATUSES: readonly TaskStatus[] = ['starting', 'running']
+const ALERT_STATUSES: readonly TaskStatus[] = ['failed', 'out_of_credits']
 const STOPPABLE: readonly TaskStatus[] = ['starting', 'running', 'asking', 'waiting_permission', 'idle']
 const STATUS_WORDS: Record<TaskStatus, string> = {
   starting: 'running',
@@ -1063,7 +1067,9 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button } = elements
+    const Svg = e.surface !== 'terminal' && 'Svg' in elements ? elements.Svg : undefined
     const [tasks, bridge, expanded, activity, detail] = await Promise.all([
       read($, tasksAtom),
       read($, bridgeAtom),
@@ -1080,8 +1086,7 @@ export const register: Register = (on, options) => {
 
       return (
         <Box flexDirection="column" marginTop={1} paddingLeft={2}>
-          <Text>{`Model: ${plainLine(textOf(task.model)) || 'default'}`}</Text>
-          <Text>{`Effort: ${plainLine(textOf(task.effort)) || 'default'}`}</Text>
+          <Text dimColor>{`Model ${plainLine(textOf(task.model)) || 'default'} · effort ${plainLine(textOf(task.effort)) || 'default'}`}</Text>
           {shown?.error !== undefined && <Text color="error">{`Could not load the task: ${plainLine(shown.error)}`}</Text>}
           <Text bold>Brief</Text>
           {shown?.brief !== undefined ? (
@@ -1118,20 +1123,60 @@ export const register: Register = (on, options) => {
       const cost = numberOf(task.costUsd)
       const pending = isObject(task.pending) ? task.pending : undefined
 
+      const status = STATUS_WORDS[task.status] ?? (plainLine(textOf(task.status)) || 'unknown')
+      const numbers = `${files} ${files === 1 ? 'file' : 'files'} · ${elapsed(numberOf(task.updatedAt) - numberOf(task.startedAt))} · $${cost.toFixed(4)}`
+      const meta = effort === '' ? model : `${model} · effort: ${effort}`
+      const rail = railOf(activity[task.id] ?? [])
+      const title = plainLine(textOf(task.title))
+      const isExpanded = expanded === task.id
+      const lastFile = Array.isArray(task.filesTouched) ? plainLine(textOf(task.filesTouched.at(-1))) : ''
+      const isWorking = WORKING_STATUSES.includes(task.status)
+      const pendingLine =
+        pending !== undefined
+          ? {
+              title: `${pending.type === 'permission' ? 'Permission' : 'Question'}: ${plainLine(textOf(pending.title))}`,
+              who: task.waitingOnUser === true ? 'Waiting on you' : 'Claude is answering',
+            }
+          : undefined
+
       return (
-        <Box flexDirection="column" marginBottom={1}>
-          <Button key={`card:${task.id}`} plain onPress={() => toggleCard($, task.id)}>
-            {`${labelOf(task)} · ${plainLine(textOf(task.title))}  `}
-            <Text color={STATUS_COLORS[task.status]}>{STATUS_WORDS[task.status] ?? (plainLine(textOf(task.status)) || 'unknown')}</Text>
-          </Button>
-          <Text>{effort === '' ? model : `${model} · effort: ${effort}`}</Text>
-          {step !== '' && <Text dimColor>{step}</Text>}
-          <Text>{`${files} ${files === 1 ? 'file' : 'files'} · ${elapsed(numberOf(task.updatedAt) - numberOf(task.startedAt))} · $${cost.toFixed(4)}`}</Text>
-          {pending !== undefined && (
-            <Text>{`${pending.type === 'permission' ? 'Permission' : 'Question'}: ${plainLine(textOf(pending.title))}`}</Text>
+        <Box flexDirection="column" marginBottom={1} {...(Svg === undefined ? { borderStyle: 'round', borderColor: 'subtle', paddingX: 1 } : {})}>
+          {Svg !== undefined ? (
+            <Svg
+              width={CARD_WIDTH}
+              height={cardHeight({ ...(pendingLine !== undefined ? { pending: pendingLine } : {}) })}
+              source={cardSvg({
+                title,
+                status,
+                tone: ALERT_STATUSES.includes(task.status) ? 'alert' : task.status === 'done' ? 'good' : 'plain',
+                meta: `${labelOf(task)} · ${meta}`,
+                rail,
+                target: targetOf(step, lastFile),
+                numbers,
+                isWorking,
+                ...(pendingLine !== undefined ? { pending: pendingLine } : {}),
+              })}
+              alt={`${labelOf(task)}: ${title}. ${status}. ${railLine(rail)}. ${numbers}${pendingLine !== undefined ? `. ${pendingLine.title}. ${pendingLine.who}` : ''}`}
+              {...(isWorking ? { isInteractive: true } : {})}
+            />
+          ) : (
+            <Box flexDirection="column">
+              <Text bold>{title}</Text>
+              <Text dimColor>{`${labelOf(task)} · ${meta}`}</Text>
+              {rail.length > 0 && <Text>{railLine(rail)}</Text>}
+              {targetOf(step, lastFile) !== '' && <Text dimColor>{targetOf(step, lastFile)}</Text>}
+              <Text dimColor>{numbers}</Text>
+            </Box>
           )}
-          {pending !== undefined && <Text color="warning">{task.waitingOnUser === true ? 'Waiting on you' : 'Claude is answering'}</Text>}
-          {expanded === task.id && expandedPart(task)}
+          <Box>
+            <Button key={`card:${task.id}`} plain onPress={() => toggleCard($, task.id)}>
+              <Text dimColor>{`${isExpanded ? 'Hide details' : 'Show details'}${Svg === undefined ? ' · ' : ''}`}</Text>
+              {Svg === undefined && <Text color={STATUS_COLORS[task.status]}>{status}</Text>}
+            </Button>
+          </Box>
+          {Svg === undefined && pendingLine !== undefined && <Text>{pendingLine.title}</Text>}
+          {Svg === undefined && pendingLine !== undefined && <Text color="warning">{pendingLine.who}</Text>}
+          {isExpanded && expandedPart(task)}
         </Box>
       )
     }

@@ -233,6 +233,31 @@ describe('Task', () => {
     expect(texts).toEqual(['claude:please do the thing', 'agent:first', 'claude:next', 'agent:second'])
   })
 
+  it('a new turn starts its own message and thought entries instead of growing the last turn', async () => {
+    const m = await make([
+      [thought('hmm'), msg('first'), { stop: 'end_turn' }],
+      [msg('second'), thought('again'), msg(' part'), { stop: 'end_turn' }],
+    ])
+    await m.task.start()
+    await waitStatus(m, 'idle')
+    const firstId = m.task.detail(true).activity!.at(-1)!.id
+    await m.task.reply('next')
+    await waitFor(() => m.task.summary().lastMessage === 'second part', 'second turn')
+    await waitStatus(m, 'idle')
+    const activity = m.task.detail(true).activity!
+    expect(activity.map((a) => [a.kind, a.text])).toEqual([
+      ['thought', 'hmm'],
+      ['message', 'first'],
+      ['message', 'second'],
+      ['thought', 'again'],
+      ['message', ' part'],
+    ])
+    expect(activity[1]!.id).toBe(firstId)
+    // the old turn's entry is never re-published with the new turn's text
+    const republished = m.events.flatMap((e) => (e.type === 'activity' && e.entry.id === firstId ? [e.entry.text] : []))
+    expect(republished.every((t) => t === 'first')).toBe(true)
+  })
+
   it('refuses a reply while the agent is working', async () => {
     const m = await make([[{ hang: true }]])
     await m.task.start()

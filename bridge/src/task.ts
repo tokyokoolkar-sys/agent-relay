@@ -67,6 +67,8 @@ export class Task {
   #thread: ThreadEntry[] = []
   #activity: ActivityEntry[] = []
   #activitySeq = 0
+  /** The last activity id from before the current turn: chunks only grow entries newer than this one. */
+  #turnFloor = 0
   /** The streamed entry whose latest text has not been published yet, and when it last was. */
   #stream: { entry: ActivityEntry; lastEmitAt: number; timer: NodeJS.Timeout | undefined } | undefined
   /** Agent state folders already noted on the thread as left out of the commits. */
@@ -394,6 +396,7 @@ export class Task {
     this.#turnActive = true
     this.#status = 'running'
     this.#turnText = ''
+    this.#turnFloor = this.#activitySeq // the last turn's entries are closed
     this.#changed()
     let stopReason: string | undefined
     try {
@@ -522,11 +525,11 @@ export class Task {
     }
   }
 
-  /** A thought or message chunk grows the last entry of its kind (same id); its updates are throttled. */
+  /** A thought or message chunk grows the last entry of its kind (same id) if this turn made it; its updates are throttled. */
   #chunk(kind: 'thought' | 'message', text: string): void {
     if (!text) return
     const last = this.#activity.at(-1)
-    if (last?.kind === kind) {
+    if (last?.kind === kind && last.id > this.#turnFloor) {
       last.text += text
       this.#streamed(last)
     } else this.#pushActivity({ id: ++this.#activitySeq, at: Date.now(), kind, text })
